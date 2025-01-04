@@ -1,8 +1,9 @@
 import os
 import json
 import discord
-from dotenv import load_dotenv
+from dotenv import load_dotenv 
 from discord.ext import tasks, commands
+from pytz import timezone
 from datetime import datetime
 
 # Import fetching functions for deals
@@ -60,8 +61,8 @@ async def send_deal_embed(channel, deal):
     embed.set_author(name=f"{deal.get('site_name', 'N/A')}", icon_url=f"{deal.get('logo', 'https://via.placeholder.com/150')}")
     embed.add_field(name=f"> **{deal.get('price', 'N/A')}**", value="", inline=True)
     embed.add_field(name=f"`[ {deal.get('category', '카테고리 없음')} ]`", value="", inline=True)
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    embed.set_footer(text=f"등록일: {current_time}")
+    korea_time = datetime.now(timezone('Asia/Seoul')).strftime("%Y-%m-%d %H:%M:%S")
+    embed.set_footer(text=f"등록일: {korea_time}")
     await channel.send(embed=embed)
 
 ############################
