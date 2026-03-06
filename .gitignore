@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Tool caches
+.ruff_cache/
+
+# IDE/project files
+.idea/
+.vscode/
+
+# Runtime state/logs
+bot_state.db
+bot_state.db-shm
+bot_state.db-wal
+bot_startup.lock
+identifier.sqlite
+error_log.txt
+error_log.txt.*
+audit_log.txt
+audit_log.txt.*
+error/
+backups/
+
+# OS files
+Thumbs.db
+.DS_Store

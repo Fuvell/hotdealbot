@@ -6,7 +6,7 @@ import logging
 import urllib.request
 import urllib.error
 from abc import ABCMeta, abstractmethod
-from typing import Any, Optional, TypedDict, Union, Self
+from typing import Any, TypedDict, Union
 
 class BaseArticle(TypedDict):
     article_id: int
@@ -21,8 +21,10 @@ class BaseArticle(TypedDict):
     extra: dict[str, Any]
 
 class ArticleCollection(dict[int, BaseArticle]):
-    def __init__(self, data: dict[int, BaseArticle] = {}):
+    def __init__(self, data: dict[int, BaseArticle] | None = None):
         super().__init__()
+        if data is None:
+            data = {}
         for k, v in data.items():
             self[k] = v
 
@@ -31,17 +33,6 @@ class ArticleCollection(dict[int, BaseArticle]):
 
     def __getitem__(self, __key: int) -> BaseArticle:
         return super().__getitem__(__key)
-
-    def __sub__(self, b: Self) -> "ArticleCollection":
-        return ArticleCollection({k: v for k, v in self.items() if k not in b})
-
-    def remove_expired(self, i: int) -> None:
-        remove_list = [k for k in self.keys() if k < i]
-        for k in remove_list:
-            self.pop(k)
-
-    def get_new(self, i: int) -> "ArticleCollection":
-        return ArticleCollection({k: v for k, v in self.items() if k > i})
 
 class BaseCrawler(metaclass=ABCMeta):
     """
@@ -79,12 +70,12 @@ class BaseCrawler(metaclass=ABCMeta):
     def request(self, url: str) -> str | None:
         req = urllib.request.Request(url, headers=self.headers)
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 status_code = resp.getcode()
                 if status_code != 200:
                     if status_code != self._prev_status:
                         self.logger.error(f"Client response error: {status_code} ({url})")
-                        self.dump_http_response(resp, url)
+                        self.dump_http_response(resp)
                     else:
                         self.logger.info(f"Client response error [skip]: {status_code} ({url})")
                     self._prev_status = status_code
@@ -112,7 +103,7 @@ class BaseCrawler(metaclass=ABCMeta):
         """Parse HTML => {article_id: BaseArticle}."""
         pass
 
-    def dump_http_response(self, resp: urllib.request.addinfourl, url: str):
+    def dump_http_response(self, resp: urllib.request.addinfourl):
         """Save raw response to 'error/' folder for debugging."""
         current_datetime = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         if not os.path.exists("error"):
@@ -124,5 +115,5 @@ class BaseCrawler(metaclass=ABCMeta):
             with open(filename, "wb") as f:
                 f.write(content)
             self.logger.debug(f"Dumped response binary to {filename}")
-        except:
+        except Exception:
             self.logger.debug("Could not dump HTTP response")
