@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from typing import Any, Mapping
 
@@ -186,6 +188,11 @@ def normalize_loaded_excluded_sites_by_guild(
     return normalized_data
 
 
+def get_deal_site_code(deal: Mapping[str, Any]) -> str | None:
+    """Canonical site code for a deal, computed once per deal."""
+    return canonicalize_site_input_token(str(deal.get("site_code", "") or ""))
+
+
 def is_deal_site_excluded_for_codes(
     excluded_site_codes: set[str],
     deal: Mapping[str, Any],
@@ -193,7 +200,7 @@ def is_deal_site_excluded_for_codes(
     if not excluded_site_codes:
         return False
 
-    site_code = canonicalize_site_input_token(str(deal.get("site_code", "") or ""))
+    site_code = get_deal_site_code(deal)
     if site_code is None:
         return False
     return site_code in excluded_site_codes

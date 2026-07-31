@@ -1,15 +1,16 @@
+from __future__ import annotations
+
 import re
 import time
 from typing import Dict, List
 from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
 
 try:
-    from .base_crawler import BaseArticle, BaseCrawler
+    from .base_crawler import BaseArticle, BaseCrawler, make_soup
 except ImportError:
-    from base_crawler import BaseArticle, BaseCrawler
+    from base_crawler import BaseArticle, BaseCrawler, make_soup
 
 try:
     from ..deal_key import encode_deal_key
@@ -27,6 +28,7 @@ PPOMPPU_DESKTOP_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
+PPOMPPU_LOGO_URL = "https://www.google.com/s2/favicons?domain=ppomppu.co.kr&sz=64"
 
 
 def _normalize_category_token(raw: str) -> str:
@@ -214,7 +216,7 @@ class PpomppuCrawler(BaseCrawler):
         return None
 
     def parsing(self, html: str) -> Dict[int, BaseArticle]:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = make_soup(html)
         rows = soup.select("tr.baseList")
         if not rows:
             self.logger.error("Can't find article list rows, skip parsing")
@@ -273,7 +275,7 @@ class PpomppuCrawler(BaseCrawler):
                     else ""
                 ),
                 "crawler_name": self.name,
-                "logo": "source/logo_ppomppu.jpg",
+                "logo": PPOMPPU_LOGO_URL,
                 "url": urljoin(PPOMPPU_BASE_URL + "/zboard/", href),
                 "is_end": False,
                 "extra": {
@@ -284,11 +286,21 @@ class PpomppuCrawler(BaseCrawler):
         return data
 
 
+_CRAWLER: PpomppuCrawler | None = None
+
+
+def _get_crawler() -> PpomppuCrawler:
+    global _CRAWLER
+    if _CRAWLER is None:
+        _CRAWLER = PpomppuCrawler(
+            name="Ppomppu",
+            url_list=[PPOMPPU_LIST_URL],
+        )
+    return _CRAWLER
+
+
 def fetch_hot_deals_ppomppu() -> List[dict]:
-    crawler = PpomppuCrawler(
-        name="Ppomppu",
-        url_list=[PPOMPPU_LIST_URL],
-    )
+    crawler = _get_crawler()
     articles = crawler.get()
 
     deals_list: List[dict] = []
@@ -301,9 +313,15 @@ def fetch_hot_deals_ppomppu() -> List[dict]:
         if not title:
             continue
 
+        try:
+            deal_id = encode_deal_key("pp", PPOMPPU_BOARD_ID, article_id)
+        except ValueError as e:
+            crawler.logger.warning(f"Skipping article with invalid key parts: {e}")
+            continue
+
         deals_list.append(
             {
-                "id": encode_deal_key("pp", PPOMPPU_BOARD_ID, article_id),
+                "id": deal_id,
                 "site_code": PPOMPPU_SITE_CODE,
                 "title": title,
                 "category": str(article.get("category", "기타") or "기타"),

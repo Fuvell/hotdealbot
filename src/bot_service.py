@@ -1,10 +1,12 @@
-﻿import asyncio
+from __future__ import annotations
+
+import asyncio
 import os
 import re
 import unicodedata
 from collections import defaultdict, deque
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Mapping
@@ -12,19 +14,20 @@ from urllib.parse import urlparse
 
 import discord
 from discord.ext import commands
-from pytz import timezone
 
 try:
     from .crawlers.arca_crawler import fetch_hot_deals_arca
-    from .crawlers.eomisae_crawler import fetch_hot_deals_eomisae
-    from .crawlers.fmkorea_crawler import fetch_hot_deals_fmkorea
+    from .crawlers.eomisae_crawler import enrich_deal_eomisae, fetch_hot_deals_eomisae
+    from .crawlers.fmkorea_crawler import enrich_deal_fmkorea, fetch_hot_deals_fmkorea
     from .crawlers.ppomppu_crawler import fetch_hot_deals_ppomppu
     from .category_filters import (
         get_deal_category_for_display,
+        get_deal_category_token,
         is_deal_excluded_for_norms,
         normalize_loaded_excluded_categories_by_guild,
     )
     from .site_filters import (
+        get_deal_site_code,
         is_deal_site_excluded_for_codes,
         normalize_loaded_excluded_sites_by_guild,
     )
@@ -34,14 +37,14 @@ try:
         get_storage_key_for_deal,
     )
     from .crawlers.quasarzone_crawler import fetch_hot_deals
-    from .error_logging import get_error_logger
+    from .error_logging import get_error_logger, get_runtime_logger
     from .storage import (
         init_db,
         load_excluded_categories_by_guild,
         load_excluded_sites_by_guild,
         load_registered_channels,
         load_sent_deal_ids,
-        mark_deal_sent,
+        mark_deals_sent,
         purge_sent_deals_older_than,
         remove_registered_channel_by_channel_id,
         remove_registered_channel_by_guild_id,
@@ -53,18 +56,21 @@ try:
         replace_sent_deal_ids,
         upsert_user_alert_keyword,
         upsert_registered_channel,
+        vacuum_db,
     )
 except ImportError:
     from crawlers.arca_crawler import fetch_hot_deals_arca
-    from crawlers.eomisae_crawler import fetch_hot_deals_eomisae
-    from crawlers.fmkorea_crawler import fetch_hot_deals_fmkorea
+    from crawlers.eomisae_crawler import enrich_deal_eomisae, fetch_hot_deals_eomisae
+    from crawlers.fmkorea_crawler import enrich_deal_fmkorea, fetch_hot_deals_fmkorea
     from crawlers.ppomppu_crawler import fetch_hot_deals_ppomppu
     from category_filters import (
         get_deal_category_for_display,
+        get_deal_category_token,
         is_deal_excluded_for_norms,
         normalize_loaded_excluded_categories_by_guild,
     )
     from site_filters import (
+        get_deal_site_code,
         is_deal_site_excluded_for_codes,
         normalize_loaded_excluded_sites_by_guild,
     )
@@ -74,14 +80,14 @@ except ImportError:
         get_storage_key_for_deal,
     )
     from crawlers.quasarzone_crawler import fetch_hot_deals
-    from error_logging import get_error_logger
+    from error_logging import get_error_logger, get_runtime_logger
     from storage import (
         init_db,
         load_excluded_categories_by_guild,
         load_excluded_sites_by_guild,
         load_registered_channels,
         load_sent_deal_ids,
-        mark_deal_sent,
+        mark_deals_sent,
         purge_sent_deals_older_than,
         remove_registered_channel_by_channel_id,
         remove_registered_channel_by_guild_id,
@@ -93,10 +99,18 @@ except ImportError:
         replace_sent_deal_ids,
         upsert_user_alert_keyword,
         upsert_registered_channel,
+        vacuum_db,
     )
 
 error_logger = get_error_logger()
+runtime_logger = get_runtime_logger()
 PROJECT_BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Detail-page enrichment runs only for NEW deals (post-dedup), keyed by site.
+DEAL_ENRICHERS: dict[str, Callable[[dict], None]] = {
+    "fmkorea": enrich_deal_fmkorea,
+    "eomisae": enrich_deal_eomisae,
+}
 
 
 @dataclass(frozen=True)
@@ -114,12 +128,42 @@ class DeliveryResult:
     reason: str = ""
 
 
+@dataclass
+class PlannedDeal:
+    deal: dict[str, Any]
+    lookup_keys: list[str]
+    storage_key: str | None
+    channel_targets: list[tuple[int, int]]  # (guild_id, channel_id)
+    alert_matches: dict[int, list[str]]
+
+
+@dataclass
+class DeliveryPlan:
+    items: list[PlannedDeal] = field(default_factory=list)
+
+
+@dataclass
+class DealOutcome:
+    planned: PlannedDeal
+    delivered: bool = False
+    retryable_failures: int = 0
+    permanent_failures: int = 0
+    reasons: list[str] = field(default_factory=list)
+
+
 class HotDealService:
     ALERT_KEYWORD_MAX_COUNT = 5
-    ALERT_KEYWORD_MIN_LEN = 2
+    # NOTE: minimum is 3 because the anti-abuse check rejects any keyword
+    # whose normalized form is 2 characters or fewer.
+    ALERT_KEYWORD_MIN_LEN = 3
     ALERT_KEYWORD_MAX_LEN = 15
     SENT_DEAL_RETENTION_DAYS = 60
     CRAWLER_TIMEOUT_SECONDS = 20.0
+    CRAWLER_TIMEOUT_SECONDS_BY_NAME = {
+        # fmkorea may fall back to Playwright; eomisae may need detail pages.
+        "fmkorea": 60.0,
+        "eomisae": 30.0,
+    }
     CRAWLER_RETRY_DELAYS_SECONDS = (1.0, 2.0)
     CRAWLER_CIRCUIT_FAIL_THRESHOLD = 3
     CRAWLER_CIRCUIT_OPEN_SECONDS = 300.0
@@ -131,6 +175,14 @@ class HotDealService:
     CRAWLER_PARSE_ANOMALY_THRESHOLD = 3
     CRAWLER_MIN_EXPECTED_COUNT = 1
     DISCORD_API_CHECK_TIMEOUT_SECONDS = 10.0
+    ENRICH_TIMEOUT_SECONDS = 15.0
+    EMBEDS_PER_MESSAGE = 10
+    # Flood guard: max new deals accepted per site per cycle; the overflow is
+    # marked seen without posting (protects channels after outages/first runs).
+    MAX_NEW_DEALS_PER_SITE_PER_CYCLE = 10
+    # Give-up thresholds for deals that keep failing to deliver.
+    PERMANENT_FAILURE_GIVE_UP_CYCLES = 3
+    ANY_FAILURE_GIVE_UP_CYCLES = 10
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -150,6 +202,7 @@ class HotDealService:
         self.crawler_last_deal_count: dict[str, int] = {}
         self.runtime_metrics: dict[str, int] = defaultdict(int)
         self.alert_last_update_monotonic_by_user: dict[int, float] = {}
+        self.delivery_failure_counts: dict[str, int] = {}
         self.last_sent_deals_purge_monotonic = 0.0
 
         allowlist_raw = os.getenv(
@@ -165,6 +218,9 @@ class HotDealService:
             str(os.getenv("ENFORCE_SOURCE_DOMAIN_ALLOWLIST", "1")).strip() != "0"
         )
 
+    ############################
+    # State loading / config
+    ############################
     def initialize_state(self) -> None:
         init_db()
         purged_rows = purge_sent_deals_older_than(self.SENT_DEAL_RETENTION_DAYS)
@@ -175,15 +231,22 @@ class HotDealService:
         compacted_sent_keys = {
             key for key in (compact_existing_key(k) for k in self.posted_deal_ids) if key
         }
-        if compacted_sent_keys != self.posted_deal_ids:
+        compacted = compacted_sent_keys != self.posted_deal_ids
+        if compacted:
             replace_sent_deal_ids(compacted_sent_keys)
             self.posted_deal_ids = compacted_sent_keys
-            print(
+            runtime_logger.info(
                 "Compacted sent deal keys: "
                 f"{before_compact_count} rows -> {len(compacted_sent_keys)} rows"
             )
 
-        print(
+        if purged_rows or compacted:
+            try:
+                vacuum_db()
+            except Exception:
+                error_logger.exception("Failed to VACUUM after startup purge.")
+
+        runtime_logger.info(
             "Loaded state from SQLite: "
             f"channels={len(self.registered_channels)}, "
             f"category-filter-configs={len(self.excluded_categories_by_guild)}, "
@@ -192,7 +255,7 @@ class HotDealService:
             f"sent_ids={len(self.posted_deal_ids)}"
         )
         if purged_rows:
-            print(
+            runtime_logger.info(
                 "Purged old sent-deal rows: "
                 f"{purged_rows} rows older than {self.SENT_DEAL_RETENTION_DAYS} days"
             )
@@ -277,6 +340,9 @@ class HotDealService:
         upsert_registered_channel(guild_id, channel_id, guild_name)
         return True
 
+    ############################
+    # Alert keywords
+    ############################
     @staticmethod
     def normalize_alert_text(value: str) -> str:
         normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
@@ -332,17 +398,16 @@ class HotDealService:
     def get_alert_keyword_count_for_user(self, user_id: int) -> int:
         return len(self.alert_rules_by_user.get(int(user_id), {}))
 
-    def check_alert_update_cooldown(self, user_id: int) -> tuple[bool, float]:
+    def try_alert_update(self, user_id: int) -> tuple[bool, float]:
+        """Atomically check the cooldown and, if allowed, consume it."""
         user_id_int = int(user_id)
         now = monotonic()
         last_update = self.alert_last_update_monotonic_by_user.get(user_id_int, 0.0)
         elapsed = now - last_update
         if elapsed >= self.ALERT_UPDATE_COOLDOWN_SECONDS:
+            self.alert_last_update_monotonic_by_user[user_id_int] = now
             return True, 0.0
         return False, max(0.0, self.ALERT_UPDATE_COOLDOWN_SECONDS - elapsed)
-
-    def touch_alert_update(self, user_id: int) -> None:
-        self.alert_last_update_monotonic_by_user[int(user_id)] = monotonic()
 
     def get_alert_keyword_abuse_reason(self, rule: AlertKeywordRule) -> str | None:
         keyword_norm = rule.keyword_norm
@@ -363,11 +428,11 @@ class HotDealService:
                 "sale",
                 "hotdeal",
                 "discount",
-                "\ubb34\ub8cc",
-                "\ud56b\ub51c",
-                "\ud2b9\uac00",
-                "\uc138\uc77c",
-                "\ud560\uc778",
+                "무료",
+                "핫딜",
+                "특가",
+                "세일",
+                "할인",
             )
         }
         if keyword_norm in generic_norms:
@@ -445,6 +510,9 @@ class HotDealService:
 
         return matches_by_user
 
+    ############################
+    # DM rate limiting
+    ############################
     def _prune_alert_dm_window(self, user_id: int, now: float) -> None:
         timestamps = self.alert_dm_timestamps_by_user.get(user_id)
         if timestamps is None:
@@ -483,6 +551,9 @@ class HotDealService:
         timestamps.append(now)
         self._prune_alert_dm_window(user_id, now)
 
+    ############################
+    # Source URL allowlist
+    ############################
     @staticmethod
     def _is_retryable_http_exception(error: discord.HTTPException) -> bool:
         status = getattr(error, "status", None)
@@ -515,25 +586,353 @@ class HotDealService:
             for domain in self.allowed_source_domains
         )
 
-    async def send_deal_embed_with_retry(
-        self,
-        channel: discord.abc.MessageableChannel,
-        deal: Mapping[str, Any],
-        channel_id: int,
-    ) -> DeliveryResult:
-        source_url = str(deal.get("url", "") or "").strip()
-        if not self.is_source_url_allowed(source_url):
-            error_logger.error(
-                "Blocked deal send due to source-domain allowlist. "
-                f"channel_id={channel_id}, url={source_url}"
-            )
-            return DeliveryResult(
-                success=False,
-                retryable_failure=False,
-                channel_stale=False,
-                reason="source-url-disallowed",
+    ############################
+    # Delivery pipeline
+    ############################
+    def get_deal_keys(self, deal: Mapping[str, object]) -> list[str]:
+        return get_lookup_keys_for_deal(deal)
+
+    def build_delivery_plan(self, all_deals: list[dict]) -> DeliveryPlan:
+        """
+        Phase 1 of the delivery cycle (caller must hold deal_state_lock):
+        dedup fetched deals, apply the per-site burst cap, and compute each
+        new deal's eligible channels and alert matches from a single snapshot.
+        Deals with no recipients are marked seen in one batch.
+        """
+        plan = DeliveryPlan()
+        seen_in_cycle: set[str] = set()
+        new_count_by_site: dict[str, int] = defaultdict(int)
+        burst_skipped_by_site: dict[str, int] = defaultdict(int)
+        keys_to_mark: list[str] = []
+
+        for deal in all_deals:
+            lookup_keys = self.get_deal_keys(deal)
+            if not lookup_keys:
+                continue
+
+            if any(key in seen_in_cycle for key in lookup_keys):
+                continue
+            seen_in_cycle.update(lookup_keys)
+
+            if any(key in self.posted_deal_ids for key in lookup_keys):
+                continue
+
+            storage_key = get_storage_key_for_deal(deal)
+            site_code = get_deal_site_code(deal) or str(deal.get("site_code", "") or "")
+            category_token = get_deal_category_token(deal)
+
+            new_count_by_site[site_code] += 1
+            if new_count_by_site[site_code] > self.MAX_NEW_DEALS_PER_SITE_PER_CYCLE:
+                burst_skipped_by_site[site_code] += 1
+                if storage_key and storage_key not in self.posted_deal_ids:
+                    self.posted_deal_ids.add(storage_key)
+                    keys_to_mark.append(storage_key)
+                continue
+
+            alert_matches = self.get_alert_matches_for_deal(deal)
+
+            channel_targets: list[tuple[int, int]] = []
+            for guild_id, channel_id in self.registered_channels.items():
+                if category_token in self.excluded_categories_by_guild.get(guild_id, set()):
+                    continue
+                if site_code and site_code in self.excluded_sites_by_guild.get(guild_id, set()):
+                    continue
+                channel_targets.append((guild_id, channel_id))
+
+            if not channel_targets and not alert_matches:
+                if storage_key and storage_key not in self.posted_deal_ids:
+                    self.posted_deal_ids.add(storage_key)
+                    keys_to_mark.append(storage_key)
+                continue
+
+            plan.items.append(
+                PlannedDeal(
+                    deal=deal,
+                    lookup_keys=lookup_keys,
+                    storage_key=storage_key,
+                    channel_targets=channel_targets,
+                    alert_matches=alert_matches,
+                )
             )
 
+        if keys_to_mark:
+            mark_deals_sent(keys_to_mark)
+
+        for site, skipped_count in burst_skipped_by_site.items():
+            runtime_logger.info(
+                f"Burst cap: suppressed {skipped_count} extra new deal(s) from "
+                f"site '{site}' this cycle."
+            )
+
+        return plan
+
+    async def enrich_new_deals(self, items: list[PlannedDeal]) -> None:
+        """Fetch detail-page image/price for new deals only (best-effort)."""
+        loop = asyncio.get_running_loop()
+
+        async def _enrich_one(item: PlannedDeal) -> None:
+            site_code = str(item.deal.get("site_code", "") or "")
+            enricher = DEAL_ENRICHERS.get(site_code)
+            if enricher is None:
+                return
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, enricher, item.deal),
+                    timeout=self.ENRICH_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                runtime_logger.info(
+                    f"Deal enrichment timed out. site={site_code}, "
+                    f"id={item.deal.get('id', 'unknown')}"
+                )
+            except Exception:
+                error_logger.exception(
+                    f"Deal enrichment failed. site={site_code}, "
+                    f"id={item.deal.get('id', 'unknown')}"
+                )
+
+        if items:
+            await asyncio.gather(*(_enrich_one(item) for item in items))
+
+    async def deliver_plan(
+        self,
+        plan: DeliveryPlan,
+    ) -> tuple[list[DealOutcome], set[int]]:
+        """
+        Phase 2 of the delivery cycle (no lock held): send embeds in batches
+        of up to EMBEDS_PER_MESSAGE per channel, all channels concurrently,
+        plus keyword-alert DMs grouped per user.
+        """
+        outcomes: dict[int, DealOutcome] = {
+            id(item): DealOutcome(planned=item) for item in plan.items
+        }
+        stale_channel_ids: set[int] = set()
+
+        by_channel: dict[int, tuple[int, list[PlannedDeal]]] = {}
+        for item in plan.items:
+            for guild_id, channel_id in item.channel_targets:
+                if channel_id not in by_channel:
+                    by_channel[channel_id] = (guild_id, [])
+                by_channel[channel_id][1].append(item)
+
+        async def deliver_channel(
+            channel_id: int,
+            guild_id: int,
+            items: list[PlannedDeal],
+        ) -> None:
+            async with self.deal_state_lock:
+                if self.registered_channels.get(guild_id) != channel_id:
+                    return
+
+            channel = await self.resolve_channel(channel_id)
+            if channel is None:
+                for item in items:
+                    outcome = outcomes[id(item)]
+                    outcome.retryable_failures += 1
+                    outcome.reasons.append(f"channel:{channel_id}:unresolved")
+                if await self.is_registered_channel_stale(channel_id):
+                    stale_channel_ids.add(channel_id)
+                return
+
+            if not isinstance(channel, discord.abc.Messageable):
+                stale_channel_ids.add(channel_id)
+                for item in items:
+                    outcome = outcomes[id(item)]
+                    outcome.permanent_failures += 1
+                    outcome.reasons.append(f"channel:{channel_id}:not-messageable")
+                return
+
+            sendable: list[PlannedDeal] = []
+            for item in items:
+                if not self.is_source_url_allowed(str(item.deal.get("url", "") or "")):
+                    outcome = outcomes[id(item)]
+                    outcome.permanent_failures += 1
+                    outcome.reasons.append(f"channel:{channel_id}:source-url-disallowed")
+                    error_logger.error(
+                        "Blocked deal send due to source-domain allowlist. "
+                        f"channel_id={channel_id}, url={item.deal.get('url', '')}"
+                    )
+                    continue
+                sendable.append(item)
+
+            batch_size = self.EMBEDS_PER_MESSAGE
+            for start in range(0, len(sendable), batch_size):
+                chunk = sendable[start:start + batch_size]
+                embeds = [self.build_deal_embed(item.deal) for item in chunk]
+                result = await self.send_embeds_with_retry(channel, embeds, channel_id)
+
+                if result.success:
+                    for item in chunk:
+                        outcomes[id(item)].delivered = True
+                    continue
+
+                if result.channel_stale:
+                    stale_channel_ids.add(channel_id)
+                    for item in chunk:
+                        outcome = outcomes[id(item)]
+                        outcome.permanent_failures += 1
+                        outcome.reasons.append(f"channel:{channel_id}:{result.reason}")
+                    return
+
+                if not result.retryable_failure and len(chunk) > 1:
+                    # A batch-level 400 usually means one bad embed; isolate it
+                    # by falling back to individual sends.
+                    for item, embed in zip(chunk, embeds):
+                        single = await self.send_embeds_with_retry(
+                            channel, [embed], channel_id
+                        )
+                        outcome = outcomes[id(item)]
+                        if single.success:
+                            outcome.delivered = True
+                        elif single.channel_stale:
+                            stale_channel_ids.add(channel_id)
+                            outcome.permanent_failures += 1
+                            outcome.reasons.append(
+                                f"channel:{channel_id}:{single.reason}"
+                            )
+                            return
+                        elif single.retryable_failure:
+                            outcome.retryable_failures += 1
+                            outcome.reasons.append(
+                                f"channel:{channel_id}:{single.reason}"
+                            )
+                        else:
+                            outcome.permanent_failures += 1
+                            outcome.reasons.append(
+                                f"channel:{channel_id}:{single.reason}"
+                            )
+                    continue
+
+                for item in chunk:
+                    outcome = outcomes[id(item)]
+                    if result.retryable_failure:
+                        outcome.retryable_failures += 1
+                    else:
+                        outcome.permanent_failures += 1
+                    outcome.reasons.append(f"channel:{channel_id}:{result.reason}")
+
+        async def deliver_dms() -> None:
+            deals_by_user: dict[int, list[tuple[PlannedDeal, list[str]]]] = {}
+            for item in plan.items:
+                for user_id, matched_keywords in item.alert_matches.items():
+                    deals_by_user.setdefault(user_id, []).append(
+                        (item, matched_keywords)
+                    )
+
+            async def dm_user(
+                user_id: int,
+                entries: list[tuple[PlannedDeal, list[str]]],
+            ) -> None:
+                for item, matched_keywords in entries:
+                    try:
+                        result = await self.send_alert_dm(
+                            user_id, item.deal, matched_keywords
+                        )
+                    except Exception as e:
+                        error_logger.exception(
+                            "Unexpected error while sending keyword alert DM. "
+                            f"user_id={user_id}"
+                        )
+                        outcome = outcomes[id(item)]
+                        outcome.retryable_failures += 1
+                        outcome.reasons.append(f"dm:{user_id}:{type(e).__name__}")
+                        continue
+
+                    outcome = outcomes[id(item)]
+                    if result.success:
+                        outcome.delivered = True
+                    elif result.retryable_failure:
+                        outcome.retryable_failures += 1
+                        outcome.reasons.append(f"dm:{user_id}:{result.reason}")
+                    else:
+                        outcome.permanent_failures += 1
+                        outcome.reasons.append(f"dm:{user_id}:{result.reason}")
+
+            if deals_by_user:
+                await asyncio.gather(
+                    *(dm_user(uid, entries) for uid, entries in deals_by_user.items())
+                )
+
+        channel_tasks = [
+            deliver_channel(channel_id, guild_id, items)
+            for channel_id, (guild_id, items) in by_channel.items()
+        ]
+        await asyncio.gather(*channel_tasks, deliver_dms())
+
+        return list(outcomes.values()), stale_channel_ids
+
+    def finalize_deliveries(
+        self,
+        outcomes: list[DealOutcome],
+        stale_channel_ids: set[int],
+    ) -> None:
+        """
+        Phase 3 of the delivery cycle (caller must hold deal_state_lock):
+        batch-mark delivered deals as seen, unregister stale channels, and
+        give up on deals that keep failing so they never retry forever.
+        """
+        for stale_channel_id in stale_channel_ids:
+            if self.unregister_channel_by_channel_id(stale_channel_id):
+                runtime_logger.info(
+                    f"Removed stale channel from DB during send: {stale_channel_id}"
+                )
+
+        keys_to_mark: list[str] = []
+        for outcome in outcomes:
+            storage_key = outcome.planned.storage_key
+
+            if outcome.delivered:
+                if storage_key:
+                    if storage_key not in self.posted_deal_ids:
+                        self.posted_deal_ids.add(storage_key)
+                        keys_to_mark.append(storage_key)
+                    self.delivery_failure_counts.pop(storage_key, None)
+                continue
+
+            if storage_key is None:
+                continue
+
+            failure_count = self.delivery_failure_counts.get(storage_key, 0) + 1
+            self.delivery_failure_counts[storage_key] = failure_count
+            permanent_only = (
+                outcome.permanent_failures > 0 and outcome.retryable_failures == 0
+            )
+            give_up = (
+                permanent_only
+                and failure_count >= self.PERMANENT_FAILURE_GIVE_UP_CYCLES
+            ) or failure_count >= self.ANY_FAILURE_GIVE_UP_CYCLES
+
+            if give_up:
+                self.delivery_failure_counts.pop(storage_key, None)
+                if storage_key not in self.posted_deal_ids:
+                    self.posted_deal_ids.add(storage_key)
+                    keys_to_mark.append(storage_key)
+                error_logger.error(
+                    "Giving up on undeliverable deal after repeated failures. "
+                    f"key={storage_key}, cycles={failure_count}, "
+                    f"reasons={';'.join(outcome.reasons[:6])}"
+                )
+            else:
+                runtime_logger.info(
+                    f"No successful deliveries for {storage_key}; retrying later. "
+                    f"attempt={failure_count}, "
+                    f"retryable={outcome.retryable_failures}, "
+                    f"permanent={outcome.permanent_failures}, "
+                    f"reasons={';'.join(outcome.reasons[:6])}"
+                )
+
+        if keys_to_mark:
+            mark_deals_sent(keys_to_mark)
+
+    ############################
+    # Discord send primitives
+    ############################
+    async def send_embeds_with_retry(
+        self,
+        channel: Any,
+        embeds: list[discord.Embed],
+        channel_id: int,
+    ) -> DeliveryResult:
         delays = (0.0, *self.DISCORD_SEND_RETRY_DELAYS_SECONDS)
 
         for attempt_index, delay in enumerate(delays, start=1):
@@ -541,7 +940,10 @@ class HotDealService:
                 await asyncio.sleep(delay)
 
             try:
-                await self.send_deal_embed(channel, deal)
+                await channel.send(
+                    embeds=embeds,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return DeliveryResult(success=True, reason="sent")
             except (discord.NotFound, discord.Forbidden) as e:
                 error_logger.error(
@@ -595,6 +997,13 @@ class HotDealService:
                 retryable_failure=False,
                 channel_stale=False,
                 reason="dm-rate-limited",
+            )
+
+        if not self.is_source_url_allowed(str(deal.get("url", "") or "")):
+            return DeliveryResult(
+                success=False,
+                retryable_failure=False,
+                reason="source-url-disallowed",
             )
 
         user = self.bot.get_user(user_id_int)
@@ -654,16 +1063,12 @@ class HotDealService:
             if delay > 0:
                 await asyncio.sleep(delay)
 
-            files: list[discord.File] = []
             try:
-                embed, files = self.build_deal_embed_payload(deal)
-                send_kwargs: dict[str, Any] = {
-                    "embed": embed,
-                    "allowed_mentions": discord.AllowedMentions.none(),
-                }
-                if files:
-                    send_kwargs["files"] = files
-                await user.send(**send_kwargs)
+                embed = self.build_deal_embed(deal)
+                await user.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 self._record_alert_dm_sent(user_id_int)
                 return DeliveryResult(success=True, reason="dm-sent")
             except (discord.Forbidden, discord.NotFound) as e:
@@ -701,9 +1106,6 @@ class HotDealService:
                     retryable_failure=True,
                     reason=f"{type(e).__name__}:{e}",
                 )
-            finally:
-                for file in files:
-                    file.close()
 
         return DeliveryResult(
             success=False,
@@ -711,9 +1113,9 @@ class HotDealService:
             reason="unknown-dm-failure",
         )
 
-    def get_deal_keys(self, deal: Mapping[str, object]) -> list[str]:
-        return get_lookup_keys_for_deal(deal)
-
+    ############################
+    # Seen-key bookkeeping
+    ############################
     def maybe_purge_old_sent_deals(self, min_interval_seconds: float = 3600.0) -> int:
         now = monotonic()
         if now - self.last_sent_deals_purge_monotonic < min_interval_seconds:
@@ -723,11 +1125,24 @@ class HotDealService:
         purged_rows = purge_sent_deals_older_than(self.SENT_DEAL_RETENTION_DAYS)
         if purged_rows:
             self.posted_deal_ids = load_sent_deal_ids()
-            print(
+            runtime_logger.info(
                 "Periodic sent-deal purge removed rows: "
                 f"{purged_rows} (retention={self.SENT_DEAL_RETENTION_DAYS}d)"
             )
+
+        self._prune_transient_user_state(now)
         return purged_rows
+
+    def _prune_transient_user_state(self, now: float) -> None:
+        """Keep the small per-user bookkeeping dicts from growing forever."""
+        stale_cooldown_age = self.ALERT_UPDATE_COOLDOWN_SECONDS * 10
+        for user_id in list(self.alert_last_update_monotonic_by_user):
+            if now - self.alert_last_update_monotonic_by_user[user_id] > stale_cooldown_age:
+                self.alert_last_update_monotonic_by_user.pop(user_id, None)
+
+        for user_id in list(self.alert_dm_suppress_log_until_by_user):
+            if now >= self.alert_dm_suppress_log_until_by_user[user_id]:
+                self.alert_dm_suppress_log_until_by_user.pop(user_id, None)
 
     def mark_deal_as_seen(self, deal: Mapping[str, object]) -> str | None:
         storage_key = get_storage_key_for_deal(deal)
@@ -736,9 +1151,20 @@ class HotDealService:
 
         if storage_key not in self.posted_deal_ids:
             self.posted_deal_ids.add(storage_key)
-            mark_deal_sent(storage_key)
+            mark_deals_sent([storage_key])
 
         return storage_key
+
+    def mark_deals_as_seen(self, deals: list[Mapping[str, object]]) -> int:
+        keys_to_mark: list[str] = []
+        for deal in deals:
+            storage_key = get_storage_key_for_deal(deal)
+            if storage_key and storage_key not in self.posted_deal_ids:
+                self.posted_deal_ids.add(storage_key)
+                keys_to_mark.append(storage_key)
+        if keys_to_mark:
+            mark_deals_sent(keys_to_mark)
+        return len(keys_to_mark)
 
     def is_deal_excluded_for_guild(self, guild_id: int, deal: Mapping[str, Any]) -> bool:
         excluded_norms = self.get_excluded_category_norms_for_guild(guild_id)
@@ -748,6 +1174,9 @@ class HotDealService:
         excluded_site_codes = self.get_excluded_site_codes_for_guild(guild_id)
         return is_deal_site_excluded_for_codes(excluded_site_codes, deal)
 
+    ############################
+    # Channel registry upkeep
+    ############################
     def unregister_channel_by_channel_id(self, channel_id: int) -> bool:
         removed = remove_registered_channel_by_channel_id(channel_id)
         if removed:
@@ -777,10 +1206,6 @@ class HotDealService:
             )
             return False
         except asyncio.TimeoutError:
-            print(
-                "Timed out while checking channel staleness. "
-                f"channel_id={channel_id}"
-            )
             error_logger.error(
                 "Timed out while checking channel staleness. "
                 f"channel_id={channel_id}, timeout={self.DISCORD_API_CHECK_TIMEOUT_SECONDS}s"
@@ -789,14 +1214,12 @@ class HotDealService:
         except (discord.NotFound, discord.Forbidden):
             return True
         except discord.HTTPException as e:
-            print(f"Transient channel check error for {channel_id}: {e}")
             error_logger.error(
                 "Transient channel check error. "
                 f"channel_id={channel_id}, error={e}"
             )
             return False
-        except Exception as e:
-            print(f"Unexpected channel check error for {channel_id}: {e}")
+        except Exception:
             error_logger.exception(
                 "Unexpected channel check error. "
                 f"channel_id={channel_id}"
@@ -804,21 +1227,36 @@ class HotDealService:
             return False
 
     async def prune_stale_registered_channels(self, reason: str) -> int:
+        channels_snapshot = list(self.registered_channels.items())
+
+        async def check_one(guild_id: int, channel_id: int) -> int | None:
+            if await self.is_registered_channel_stale(channel_id):
+                return channel_id
+            return None
+
+        results = await asyncio.gather(
+            *(check_one(guild_id, channel_id) for guild_id, channel_id in channels_snapshot)
+        )
+
         removed_count = 0
-        for guild_id, channel_id in list(self.registered_channels.items()):
-            if not await self.is_registered_channel_stale(channel_id):
+        for stale_channel_id in results:
+            if stale_channel_id is None:
                 continue
-            if self.unregister_channel_by_channel_id(channel_id):
+            if self.unregister_channel_by_channel_id(stale_channel_id):
                 removed_count += 1
-                print(
-                    f"Pruned stale channel {channel_id} from guild {guild_id}. "
-                    f"reason={reason}"
+                runtime_logger.info(
+                    f"Pruned stale channel {stale_channel_id}. reason={reason}"
                 )
 
         if removed_count:
-            print(f"Pruned {removed_count} stale registered channel(s). reason={reason}")
+            runtime_logger.info(
+                f"Pruned {removed_count} stale registered channel(s). reason={reason}"
+            )
         return removed_count
 
+    ############################
+    # Crawling
+    ############################
     def _is_crawler_circuit_open(self, crawler_name: str) -> bool:
         open_until = self.crawler_circuit_open_until.get(crawler_name, 0.0)
         return open_until > monotonic()
@@ -826,7 +1264,7 @@ class HotDealService:
     def _record_crawler_success(self, crawler_name: str, deals_count: int) -> None:
         self.crawler_consecutive_failures[crawler_name] = 0
         self.crawler_circuit_open_until.pop(crawler_name, None)
-        self.crawler_last_success_at[crawler_name] = datetime.now(timezone("UTC"))
+        self.crawler_last_success_at[crawler_name] = datetime.now(timezone.utc)
         self.crawler_last_deal_count[crawler_name] = int(deals_count)
 
         self.runtime_metrics["crawler_fetch_success_total"] += 1
@@ -874,12 +1312,15 @@ class HotDealService:
                 max(0.0, self.crawler_circuit_open_until.get(crawler_name, 0.0) - monotonic())
             )
             self.runtime_metrics["crawler_circuit_skips_total"] += 1
-            print(
+            runtime_logger.info(
                 "Crawler circuit is open. Skipping fetch this cycle. "
                 f"crawler={crawler_name}, retry_after={seconds_left}s"
             )
             return []
 
+        timeout_seconds = self.CRAWLER_TIMEOUT_SECONDS_BY_NAME.get(
+            crawler_name, self.CRAWLER_TIMEOUT_SECONDS
+        )
         delays = (0.0, *self.CRAWLER_RETRY_DELAYS_SECONDS)
         last_error_reason = "unknown"
 
@@ -891,7 +1332,7 @@ class HotDealService:
                 loop = asyncio.get_running_loop()
                 raw_deals = await asyncio.wait_for(
                     loop.run_in_executor(None, fetch_func),
-                    timeout=self.CRAWLER_TIMEOUT_SECONDS,
+                    timeout=timeout_seconds,
                 )
                 if raw_deals is None:
                     deals: list[dict] = []
@@ -902,15 +1343,15 @@ class HotDealService:
                 return deals
             except asyncio.TimeoutError:
                 last_error_reason = (
-                    f"timeout>{self.CRAWLER_TIMEOUT_SECONDS}s at attempt={attempt_index}"
+                    f"timeout>{timeout_seconds}s at attempt={attempt_index}"
                 )
-                print(
+                runtime_logger.info(
                     "Crawler timeout. "
                     f"crawler={crawler_name}, attempt={attempt_index}/{len(delays)}"
                 )
             except Exception as e:
                 last_error_reason = f"{type(e).__name__}: {e}"
-                print(
+                runtime_logger.info(
                     "Crawler fetch error. "
                     f"crawler={crawler_name}, attempt={attempt_index}/{len(delays)}, error={e}"
                 )
@@ -935,103 +1376,57 @@ class HotDealService:
         )
         return quasar_deals + arca_deals + fmkorea_deals + ppomppu_deals + eomisae_deals
 
-    async def send_deal_embed(
-        self,
-        channel: discord.abc.MessageableChannel,
-        deal: Mapping[str, Any],
-    ) -> None:
-        embed, files = self.build_deal_embed_payload(deal)
-        try:
-            send_kwargs: dict[str, Any] = {
-                "embed": embed,
-                "allowed_mentions": discord.AllowedMentions.none(),
-            }
-            if files:
-                send_kwargs["files"] = files
-            await channel.send(**send_kwargs)
-        finally:
-            for file in files:
-                file.close()
-
+    ############################
+    # Embeds
+    ############################
     @staticmethod
     def _looks_like_web_url(value: str | None) -> bool:
         text = str(value or "").strip().lower()
         return text.startswith("http://") or text.startswith("https://")
 
     @staticmethod
-    def _resolve_local_asset_file(raw_path: str | None) -> Path | None:
-        text = str(raw_path or "").strip()
-        if not text:
-            return None
-        if HotDealService._looks_like_web_url(text):
-            return None
-
-        candidate = Path(text)
-        if not candidate.is_absolute():
-            candidate = PROJECT_BASE_DIR / candidate
-
-        try:
-            resolved = candidate.resolve()
-            resolved.relative_to(PROJECT_BASE_DIR.resolve())
-        except Exception:
-            return None
-
-        if not resolved.is_file():
-            return None
-        return resolved
-
-    def build_deal_embed_payload(
-        self,
-        deal: Mapping[str, Any],
-    ) -> tuple[discord.Embed, list[discord.File]]:
-        embed = self.build_deal_embed(deal)
-        files: list[discord.File] = []
-
-        logo_path = self._resolve_local_asset_file(str(deal.get("logo", "") or ""))
-        if logo_path is not None:
-            filename = f"logo_{logo_path.stem}{logo_path.suffix.lower()}"
-            files.append(discord.File(str(logo_path), filename=filename))
-            embed.set_author(
-                name=str(deal.get("site_name", "알 수 없음") or "알 수 없음"),
-                icon_url=f"attachment://{filename}",
-            )
-
-        return embed, files
+    def _clamp_text(value: Any, limit: int) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)] + "…"
 
     def build_deal_embed(self, deal: Mapping[str, Any]) -> discord.Embed:
+        title = self._clamp_text(deal.get("title") or "핫딜", 256)
+        raw_url = str(deal.get("url", "") or "").strip()
+
         embed = discord.Embed(
-            title=deal.get("title", "핫딜"),
-            url=deal.get("url", ""),
+            title=title,
+            url=raw_url if self._looks_like_web_url(raw_url) else None,
             color=self.parse_embed_color(str(deal.get("site_color"))),
+            timestamp=datetime.now(timezone.utc),
         )
+
         raw_thumbnail = str(deal.get("image_url", "") or "").strip()
-        thumbnail_url = (
-            raw_thumbnail
-            if self._looks_like_web_url(raw_thumbnail)
-            else "https://via.placeholder.com/150"
-        )
+        if self._looks_like_web_url(raw_thumbnail):
+            embed.set_thumbnail(url=raw_thumbnail)
+
         raw_logo = str(deal.get("logo", "") or "").strip()
-        logo_url = (
-            raw_logo
-            if self._looks_like_web_url(raw_logo)
-            else "https://via.placeholder.com/150"
-        )
-        embed.set_thumbnail(url=thumbnail_url)
-        embed.set_author(
-            name=deal.get("site_name", "알 수 없음"),
-            icon_url=logo_url,
-        )
+        author_name = self._clamp_text(deal.get("site_name") or "알 수 없음", 256)
+        if self._looks_like_web_url(raw_logo):
+            embed.set_author(name=author_name, icon_url=raw_logo)
+        else:
+            embed.set_author(name=author_name)
+
         site_code = str(deal.get("site_code", "") or "").strip().lower()
         if site_code != "eomisae":
+            price = str(deal.get("price", "") or "").strip() or "가격 정보 없음"
             embed.add_field(
-                name=f"> **{deal.get('price', '가격 정보 없음')}**",
+                name=self._clamp_text(f"> **{price}**", 256),
                 value="\u200b",
                 inline=True,
             )
         category_display = get_deal_category_for_display(deal)
-        embed.add_field(name=f"`[ {category_display} ]`", value="\u200b", inline=True)
-        korea_time = datetime.now(timezone("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
-        embed.set_footer(text=korea_time)
+        embed.add_field(
+            name=self._clamp_text(f"`[ {category_display} ]`", 256),
+            value="\u200b",
+            inline=True,
+        )
         return embed
 
     async def resolve_channel(self, channel_id: int):

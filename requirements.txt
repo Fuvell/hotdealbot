@@ -1,6 +1,10 @@
-discord.py
-requests
-beautifulsoup4
-python-dotenv
-pytz
-playwright
+discord.py>=2.4
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+python-dotenv>=1.0
+psutil>=5.9
+tzdata>=2024.1
+# Optional: browser fallback for FMKorea anti-bot blocks.
+# Requires an extra step after install: `playwright install chromium`
+playwright>=1.40

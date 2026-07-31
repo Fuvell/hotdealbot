@@ -1,12 +1,14 @@
+from __future__ import annotations
+
 import re
 from typing import Dict, List
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import Tag
 
 try:
-    from .base_crawler import BaseArticle, BaseCrawler
+    from .base_crawler import BaseArticle, BaseCrawler, make_soup
 except ImportError:
-    from base_crawler import BaseArticle, BaseCrawler
+    from base_crawler import BaseArticle, BaseCrawler, make_soup
 
 try:
     from ..deal_key import encode_deal_key
@@ -59,7 +61,7 @@ def normalize_quasar_category(raw_category: str) -> str:
 
 class QuasarzoneCrawler(BaseCrawler):
     def parsing(self, html: str) -> Dict[int, BaseArticle]:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = make_soup(html)
 
         if (_board_name := soup.select_one(".l-title h2")) is None:
             self.logger.error("Can't find board name, skip parsing")
@@ -189,12 +191,21 @@ class QuasarzoneCrawler(BaseCrawler):
         return data
 
 
-def fetch_hot_deals() -> List[dict]:
-    crawler = QuasarzoneCrawler(
-        name="Quasarzone",
-        url_list=["https://quasarzone.com/bbs/qb_saleinfo"],
-    )
+_CRAWLER: QuasarzoneCrawler | None = None
 
+
+def _get_crawler() -> QuasarzoneCrawler:
+    global _CRAWLER
+    if _CRAWLER is None:
+        _CRAWLER = QuasarzoneCrawler(
+            name="Quasarzone",
+            url_list=["https://quasarzone.com/bbs/qb_saleinfo"],
+        )
+    return _CRAWLER
+
+
+def fetch_hot_deals() -> List[dict]:
+    crawler = _get_crawler()
     articles_dict = crawler.get()
 
     deals_list = []
@@ -210,9 +221,15 @@ def fetch_hot_deals() -> List[dict]:
         if not title:
             continue
 
+        try:
+            deal_id = encode_deal_key("qr", board_id, article_id)
+        except ValueError as e:
+            crawler.logger.warning(f"Skipping article with invalid key parts: {e}")
+            continue
+
         deals_list.append(
             {
-                "id": encode_deal_key("qr", board_id, article_id),
+                "id": deal_id,
                 "site_code": QUASAR_SITE_CODE,
                 "title": title,
                 "category": normalize_quasar_category(article.get("category", "")),

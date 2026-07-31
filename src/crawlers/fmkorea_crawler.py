@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import re
 import time
@@ -5,12 +7,11 @@ from typing import Dict, List
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import requests
-from bs4 import BeautifulSoup
 
 try:
-    from .base_crawler import BaseArticle, BaseCrawler
+    from .base_crawler import BaseArticle, BaseCrawler, make_soup
 except ImportError:
-    from base_crawler import BaseArticle, BaseCrawler
+    from base_crawler import BaseArticle, BaseCrawler, make_soup
 
 try:
     from ..deal_key import encode_deal_key
@@ -33,6 +34,9 @@ FMKOREA_DESKTOP_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
+FMKOREA_LOGO_URL = "https://www.google.com/s2/favicons?domain=fmkorea.com&sz=64"
+PLAYWRIGHT_COOLDOWN_SECONDS = 300.0
+DETAIL_CACHE_MAX_ENTRIES = 500
 
 
 def _normalize_category_token(raw: str) -> str:
@@ -88,6 +92,9 @@ class FMKoreaCrawler(BaseCrawler):
         self._browser_fallback_enabled = (
             str(os.getenv("FMKOREA_BROWSER_FALLBACK", "1")).strip() != "0"
         )
+        self._playwright_cooldown_until = 0.0
+        self._warmed_up = False
+        self._detail_image_cache: dict[str, str | None] = {}
         self._configure_headers()
         self._configure_proxy_from_env()
         self._configure_cookie_from_env()
@@ -157,7 +164,7 @@ class FMKoreaCrawler(BaseCrawler):
         )
 
     def _apply_security_cookie_hint(self, html: str) -> None:
-        match = re.search(r"escape\\('([0-9a-f]{32})'\\)", html)
+        match = re.search(r"escape\('([0-9a-f]{32})'\)", html)
         if match is None:
             return
         value = match.group(1)
@@ -207,12 +214,22 @@ class FMKoreaCrawler(BaseCrawler):
             return html
         return None
 
-    def _extract_primary_image_from_detail(self, detail_url: str) -> str | None:
+    def extract_primary_image_from_detail(self, detail_url: str) -> str | None:
+        if detail_url in self._detail_image_cache:
+            return self._detail_image_cache[detail_url]
+        if len(self._detail_image_cache) >= DETAIL_CACHE_MAX_ENTRIES:
+            self._detail_image_cache.clear()
+
+        image_url = self._extract_primary_image_uncached(detail_url)
+        self._detail_image_cache[detail_url] = image_url
+        return image_url
+
+    def _extract_primary_image_uncached(self, detail_url: str) -> str | None:
         html = self._fetch_detail_html_quiet(detail_url)
         if not html:
             return None
 
-        soup = BeautifulSoup(html, "html.parser")
+        soup = make_soup(html)
         selectors = ("div.rd_body img", "div.xe_content img", "article img")
         for selector in selectors:
             for image_tag in soup.select(selector):
@@ -234,6 +251,12 @@ class FMKoreaCrawler(BaseCrawler):
 
     def _request_with_playwright(self, url: str) -> str | None:
         if not self._browser_fallback_enabled:
+            return None
+
+        # Chromium cold-starts are expensive; after a failed attempt, skip the
+        # fallback for a while instead of paying the launch cost every cycle.
+        if time.monotonic() < self._playwright_cooldown_until:
+            self.logger.info("Playwright fallback on cooldown; skipping.")
             return None
 
         try:
@@ -271,15 +294,21 @@ class FMKoreaCrawler(BaseCrawler):
 
             if self._looks_like_security_page(html):
                 self.logger.error("Playwright fallback still landed on security page.")
+                self._playwright_cooldown_until = time.monotonic() + PLAYWRIGHT_COOLDOWN_SECONDS
                 return None
             return html
         except Exception as e:
             self.logger.error(f"Playwright fallback failed: {e}")
+            self._playwright_cooldown_until = time.monotonic() + PLAYWRIGHT_COOLDOWN_SECONDS
             return None
 
     def request(self, url: str) -> str | None:
         # FM코리아는 anti-bot 차단이 있어 세션 + 쿠키 힌트 + 브라우저 fallback 순으로 시도한다.
-        self._request_with_session(FMKOREA_BASE_URL + "/", timeout=10.0)
+        # The session (and its cookies) persists across cycles, so the warmup
+        # request only needs to happen once per process.
+        if not self._warmed_up:
+            self._request_with_session(FMKOREA_BASE_URL + "/", timeout=10.0)
+            self._warmed_up = True
         response = self._request_with_session(url)
         if response is None:
             return None
@@ -312,7 +341,7 @@ class FMKoreaCrawler(BaseCrawler):
         return self._request_with_playwright(url)
 
     def parsing(self, html: str) -> Dict[int, BaseArticle]:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = make_soup(html)
         rows = soup.select("table tbody tr")
         if not rows:
             self.logger.error("Can't find list rows, skip parsing")
@@ -339,7 +368,7 @@ class FMKoreaCrawler(BaseCrawler):
                 continue
 
             href = str(title_link.get("href", "") or "").strip()
-            id_match = re.search(r"(?:\\?|&)document_srl=(\d+)", href)
+            id_match = re.search(r"[?&]document_srl=(\d+)", href)
             if id_match is None:
                 continue
             article_id = int(id_match.group(1))
@@ -362,9 +391,9 @@ class FMKoreaCrawler(BaseCrawler):
                     if "/files/attach/" in candidate_url.lower():
                         image_url = candidate_url
 
-            if image_url is None:
-                image_url = self._extract_primary_image_from_detail(article_url)
-
+            # NOTE: detail-page image extraction intentionally does NOT happen
+            # here. The service enriches only deals that survive dedup (new
+            # deals), via enrich_deal_fmkorea() below.
             category = normalize_fmkorea_category(category_cell_text, title)
             price = _extract_price_from_title(raw_title) or _extract_price_from_title(title)
 
@@ -382,7 +411,7 @@ class FMKoreaCrawler(BaseCrawler):
                     else ""
                 ),
                 "crawler_name": self.name,
-                "logo": "source/fmkorea.png",
+                "logo": FMKOREA_LOGO_URL,
                 "url": article_url,
                 "is_end": False,
                 "extra": {
@@ -393,11 +422,31 @@ class FMKoreaCrawler(BaseCrawler):
         return data
 
 
+_CRAWLER: FMKoreaCrawler | None = None
+
+
+def _get_crawler() -> FMKoreaCrawler:
+    global _CRAWLER
+    if _CRAWLER is None:
+        _CRAWLER = FMKoreaCrawler(
+            name="FMKorea",
+            url_list=[FMKOREA_LIST_URL],
+        )
+    return _CRAWLER
+
+
+def enrich_deal_fmkorea(deal: dict) -> None:
+    """Fill in the detail-page image for a NEW deal (called after dedup)."""
+    if deal.get("image_url"):
+        return
+    url = str(deal.get("url", "") or "").strip()
+    if not url:
+        return
+    deal["image_url"] = _get_crawler().extract_primary_image_from_detail(url)
+
+
 def fetch_hot_deals_fmkorea() -> List[dict]:
-    crawler = FMKoreaCrawler(
-        name="FMKorea",
-        url_list=[FMKOREA_LIST_URL],
-    )
+    crawler = _get_crawler()
     articles = crawler.get()
 
     deals_list: List[dict] = []
@@ -410,9 +459,15 @@ def fetch_hot_deals_fmkorea() -> List[dict]:
         if not title:
             continue
 
+        try:
+            deal_id = encode_deal_key("fm", FMKOREA_BOARD_ID, article_id)
+        except ValueError as e:
+            crawler.logger.warning(f"Skipping article with invalid key parts: {e}")
+            continue
+
         deals_list.append(
             {
-                "id": encode_deal_key("fm", FMKOREA_BOARD_ID, article_id),
+                "id": deal_id,
                 "site_code": FMKOREA_SITE_CODE,
                 "title": title,
                 "category": str(article.get("category", "기타") or "기타"),

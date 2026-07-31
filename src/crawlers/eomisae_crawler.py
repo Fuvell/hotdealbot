@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from typing import Dict, List
 from urllib.parse import urljoin
@@ -5,9 +7,11 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 try:
-    from .base_crawler import BaseArticle, BaseCrawler
+    from .base_crawler import BaseArticle, BaseCrawler, make_soup
 except ImportError:
-    from base_crawler import BaseArticle, BaseCrawler
+    from base_crawler import BaseArticle, BaseCrawler, make_soup
+
+DETAIL_CACHE_MAX_ENTRIES = 500
 
 try:
     from ..deal_key import encode_deal_key
@@ -154,10 +158,12 @@ class EomisaeCrawler(BaseCrawler):
         self.headers["Referer"] = EOMISAE_BASE_URL + "/"
         self._detail_cache: dict[str, tuple[str | None, str]] = {}
 
-    def _extract_image_and_price_from_detail(self, detail_url: str) -> tuple[str | None, str]:
+    def extract_image_and_price_from_detail(self, detail_url: str) -> tuple[str | None, str]:
         cached = self._detail_cache.get(detail_url)
         if cached is not None:
             return cached
+        if len(self._detail_cache) >= DETAIL_CACHE_MAX_ENTRIES:
+            self._detail_cache.clear()
 
         html = self.request(detail_url)
         if not html:
@@ -165,7 +171,7 @@ class EomisaeCrawler(BaseCrawler):
             self._detail_cache[detail_url] = result
             return result
 
-        soup = BeautifulSoup(html, "html.parser")
+        soup = make_soup(html)
         content = (
             soup.select_one("div.xe_content")
             or soup.select_one("div.rd_body")
@@ -238,13 +244,8 @@ class EomisaeCrawler(BaseCrawler):
 
             article_url = _normalize_eomisae_url(href)
             price = _extract_price_from_title(title)
-
-            if (not image_url) and article_url:
-                detail_image_url, detail_price = self._extract_image_and_price_from_detail(article_url)
-                if not image_url:
-                    image_url = detail_image_url
-                if not price:
-                    price = detail_price
+            # NOTE: no detail-page fetch here — the service enriches only NEW
+            # deals (after dedup) via enrich_deal_eomisae() below.
 
             data[article_id] = {
                 "article_id": article_id,
@@ -313,8 +314,8 @@ class EomisaeCrawler(BaseCrawler):
                     raw_category = first
 
             article_url = urljoin(EOMISAE_BASE_URL, href)
-            image_url, detail_price = self._extract_image_and_price_from_detail(article_url)
-            price = _extract_price_from_title(title) or detail_price
+            image_url = None
+            price = _extract_price_from_title(title)
 
             data[article_id] = {
                 "article_id": article_id,
@@ -341,7 +342,7 @@ class EomisaeCrawler(BaseCrawler):
         return data
 
     def parsing(self, html: str) -> Dict[int, BaseArticle]:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = make_soup(html)
 
         card_data = self._parse_card_layout(soup)
         if card_data:
@@ -355,11 +356,39 @@ class EomisaeCrawler(BaseCrawler):
         return {}
 
 
+_CRAWLER: EomisaeCrawler | None = None
+
+
+def _get_crawler() -> EomisaeCrawler:
+    global _CRAWLER
+    if _CRAWLER is None:
+        _CRAWLER = EomisaeCrawler(
+            name="Eomisae",
+            url_list=[EOMISAE_LIST_URL],
+        )
+    return _CRAWLER
+
+
+def enrich_deal_eomisae(deal: dict) -> None:
+    """Fill in detail-page image/price for a NEW deal (called after dedup)."""
+    needs_image = not deal.get("image_url")
+    needs_price = not str(deal.get("price", "") or "").strip()
+    if not needs_image and not needs_price:
+        return
+
+    url = str(deal.get("url", "") or "").strip()
+    if not url:
+        return
+
+    detail_image_url, detail_price = _get_crawler().extract_image_and_price_from_detail(url)
+    if needs_image and detail_image_url:
+        deal["image_url"] = detail_image_url
+    if needs_price and detail_price:
+        deal["price"] = detail_price
+
+
 def fetch_hot_deals_eomisae() -> List[dict]:
-    crawler = EomisaeCrawler(
-        name="Eomisae",
-        url_list=[EOMISAE_LIST_URL],
-    )
+    crawler = _get_crawler()
     articles = crawler.get()
 
     deals_list: List[dict] = []
@@ -372,9 +401,15 @@ def fetch_hot_deals_eomisae() -> List[dict]:
         if not title:
             continue
 
+        try:
+            deal_id = encode_deal_key("eo", EOMISAE_BOARD_ID, article_id)
+        except ValueError as e:
+            crawler.logger.warning(f"Skipping article with invalid key parts: {e}")
+            continue
+
         deals_list.append(
             {
-                "id": encode_deal_key("eo", EOMISAE_BOARD_ID, article_id),
+                "id": deal_id,
                 "site_code": EOMISAE_SITE_CODE,
                 "title": title,
                 "category": str(article.get("category", "기타") or "기타"),

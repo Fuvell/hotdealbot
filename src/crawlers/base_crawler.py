@@ -1,12 +1,35 @@
 # base_crawler.py
 
-import os
+from __future__ import annotations
+
 import datetime
+import gzip
+import hashlib
 import logging
-import urllib.request
 import urllib.error
+import urllib.request
 from abc import ABCMeta, abstractmethod
+from pathlib import Path
 from typing import Any, TypedDict, Union
+
+from bs4 import BeautifulSoup
+
+PROJECT_BASE_DIR = Path(__file__).resolve().parent.parent.parent
+ERROR_DUMP_DIR = PROJECT_BASE_DIR / "error"
+ERROR_DUMP_MAX_FILES = 20
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+
+try:
+    import lxml  # noqa: F401
+
+    SOUP_PARSER = "lxml"
+except ImportError:
+    SOUP_PARSER = "html.parser"
+
+
+def make_soup(html: str) -> BeautifulSoup:
+    return BeautifulSoup(html, SOUP_PARSER)
+
 
 class BaseArticle(TypedDict):
     article_id: int
@@ -19,6 +42,7 @@ class BaseArticle(TypedDict):
     url: str
     is_end: bool
     extra: dict[str, Any]
+
 
 class ArticleCollection(dict[int, BaseArticle]):
     def __init__(self, data: dict[int, BaseArticle] | None = None):
@@ -34,9 +58,14 @@ class ArticleCollection(dict[int, BaseArticle]):
     def __getitem__(self, __key: int) -> BaseArticle:
         return super().__getitem__(__key)
 
+
 class BaseCrawler(metaclass=ABCMeta):
     """
-    A synchronous crawler using urllib.request, disabling compression with 'Accept-Encoding: identity'.
+    A synchronous crawler using urllib.request with gzip support.
+
+    Instances are meant to live for the whole process so that per-URL
+    parse caches (and, in subclasses, HTTP sessions/cookies) survive
+    across fetch cycles.
     """
 
     def __init__(self, name: str, url_list: list[str]) -> None:
@@ -45,26 +74,40 @@ class BaseCrawler(metaclass=ABCMeta):
         self.logger = logging.getLogger(f"crawler.{self.__class__.__name__}")
         self._prev_status = 200  # track repeated error codes
 
-        # Disables compression by forcing identity, plus a realistic User-Agent
+        # Cache of (html hash, parse result) per list URL: most 1-minute
+        # polls hit an unchanged page, so parsing can be skipped entirely.
+        self._page_hash_by_url: dict[str, str] = {}
+        self._page_result_by_url: dict[str, dict[int, BaseArticle]] = {}
+
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/114.0.0.0 Safari/537.36"
+                "Chrome/122.0.0.0 Safari/537.36"
             ),
-            "Accept-Encoding": "identity",  # no Brotli/gzip
+            "Accept-Encoding": "gzip",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://arca.live/",  # optional
         }
 
     def get(self) -> "ArticleCollection":
         data = ArticleCollection()
         for url in self.url_list:
             html = self.request(url)
-            if html:
-                parsed = self.parsing(html)
-                data.update(parsed)
+            if not html:
+                continue
+
+            digest = hashlib.blake2s(html.encode("utf-8", "replace")).hexdigest()
+            if digest == self._page_hash_by_url.get(url):
+                cached = self._page_result_by_url.get(url)
+                if cached is not None:
+                    data.update(cached)
+                    continue
+
+            parsed = self.parsing(html)
+            self._page_hash_by_url[url] = digest
+            self._page_result_by_url[url] = parsed
+            data.update(parsed)
         return data
 
     def request(self, url: str) -> str | None:
@@ -83,10 +126,20 @@ class BaseCrawler(metaclass=ABCMeta):
                 else:
                     self._prev_status = status_code
 
-                raw_data = resp.read()
-                encoding = "utf-8"
-                html = raw_data.decode(encoding, errors="replace")
-                return html
+                raw_data = resp.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw_data) > MAX_RESPONSE_BYTES:
+                    self.logger.error(f"Response exceeds {MAX_RESPONSE_BYTES} bytes; discarding ({url})")
+                    return None
+
+                content_encoding = str(resp.headers.get("Content-Encoding", "")).lower()
+                if "gzip" in content_encoding:
+                    try:
+                        raw_data = gzip.decompress(raw_data)
+                    except OSError:
+                        self.logger.error(f"Failed to gunzip response ({url})")
+                        return None
+
+                return raw_data.decode("utf-8", errors="replace")
 
         except urllib.error.HTTPError as e:
             self.logger.error(f"HTTPError: {e.code} {e.reason} ({url})")
@@ -104,16 +157,26 @@ class BaseCrawler(metaclass=ABCMeta):
         pass
 
     def dump_http_response(self, resp: urllib.request.addinfourl):
-        """Save raw response to 'error/' folder for debugging."""
+        """Save raw response to the project-level 'error/' folder for debugging."""
         current_datetime = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        if not os.path.exists("error"):
-            os.makedirs("error")
-
-        filename = os.path.join("error", f"{current_datetime}_{self.name}.html")
         try:
-            content = resp.read()
+            ERROR_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+
+            filename = ERROR_DUMP_DIR / f"{current_datetime}_{self.name}.html"
+            content = resp.read(MAX_RESPONSE_BYTES)
             with open(filename, "wb") as f:
                 f.write(content)
             self.logger.debug(f"Dumped response binary to {filename}")
+
+            dumps = sorted(
+                ERROR_DUMP_DIR.glob("*.html"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for old_dump in dumps[ERROR_DUMP_MAX_FILES:]:
+                try:
+                    old_dump.unlink()
+                except OSError:
+                    pass
         except Exception:
             self.logger.debug("Could not dump HTTP response")

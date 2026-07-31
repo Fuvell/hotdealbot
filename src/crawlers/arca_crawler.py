@@ -1,12 +1,12 @@
+from __future__ import annotations
+
 import re
 from typing import Dict, List
 
-from bs4 import BeautifulSoup
-
 try:
-    from .base_crawler import BaseArticle, BaseCrawler
+    from .base_crawler import BaseArticle, BaseCrawler, make_soup
 except ImportError:
-    from base_crawler import BaseArticle, BaseCrawler
+    from base_crawler import BaseArticle, BaseCrawler, make_soup
 
 try:
     from ..deal_key import encode_deal_key
@@ -67,8 +67,12 @@ def normalize_arca_category(raw_category: str) -> str:
 
 
 class ArcaLiveCrawler(BaseCrawler):
+    def __init__(self, name: str, url_list: list[str]) -> None:
+        super().__init__(name=name, url_list=url_list)
+        self.headers["Referer"] = "https://arca.live/"
+
     def parsing(self, html: str) -> Dict[int, BaseArticle]:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = make_soup(html)
 
         if (_board_name := soup.select_one(".board-title .title")) is None or (
             board_name := _board_name.attrs.get("data-channel-name")
@@ -161,11 +165,21 @@ class ArcaLiveCrawler(BaseCrawler):
         return data
 
 
+_CRAWLER: ArcaLiveCrawler | None = None
+
+
+def _get_crawler() -> ArcaLiveCrawler:
+    global _CRAWLER
+    if _CRAWLER is None:
+        _CRAWLER = ArcaLiveCrawler(
+            name="ArcaLive",
+            url_list=["https://arca.live/b/hotdeal"],
+        )
+    return _CRAWLER
+
+
 def fetch_hot_deals_arca() -> List[dict]:
-    crawler = ArcaLiveCrawler(
-        name="ArcaLive",
-        url_list=["https://arca.live/b/hotdeal"],
-    )
+    crawler = _get_crawler()
     articles = crawler.get()
     deals_list = []
     for article_id, article in articles.items():
@@ -177,9 +191,15 @@ def fetch_hot_deals_arca() -> List[dict]:
         if not title:
             continue
 
+        try:
+            deal_id = encode_deal_key("al", ARCA_BOARD_ID, article_id)
+        except ValueError as e:
+            crawler.logger.warning(f"Skipping article with invalid key parts: {e}")
+            continue
+
         deals_list.append(
             {
-                "id": encode_deal_key("al", ARCA_BOARD_ID, article_id),
+                "id": deal_id,
                 "site_code": ARCA_SITE_CODE,
                 "title": title,
                 "category": normalize_arca_category(article.get("category", "")),

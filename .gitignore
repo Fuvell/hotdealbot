@@ -29,6 +29,8 @@ error_log.txt
 error_log.txt.*
 audit_log.txt
 audit_log.txt.*
+runtime_log.txt
+runtime_log.txt.*
 error/
 backups/
 

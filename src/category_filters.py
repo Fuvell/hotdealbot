@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from typing import Any, Mapping
 
@@ -192,24 +194,29 @@ def normalize_loaded_excluded_categories_by_guild(
     return normalized_data
 
 
-def is_deal_excluded_for_norms(excluded_norms: set[str], deal: Mapping[str, Any]) -> bool:
-    if not excluded_norms:
-        return False
-
+def get_deal_category_token(deal: Mapping[str, Any]) -> str:
+    """
+    Canonical filter token for a deal's category, computed once per deal so
+    per-guild exclusion checks reduce to a set-membership test.
+    """
     deal_category_raw = str(deal.get("category", "") or "").strip()
     if not deal_category_raw:
-        return UNCATEGORIZED_FILTER_TOKEN in excluded_norms
+        return UNCATEGORIZED_FILTER_TOKEN
 
     canonical_deal_norm = canonicalize_category_input_token(deal_category_raw)
-    if canonical_deal_norm == UNCATEGORIZED_FILTER_TOKEN:
-        return UNCATEGORIZED_FILTER_TOKEN in excluded_norms
     if canonical_deal_norm is not None:
-        return canonical_deal_norm in excluded_norms
+        return canonical_deal_norm
 
     deal_category_norm = normalize_category_token(deal_category_raw)
     if deal_category_norm in UNCATEGORIZED_ALIAS_NORMS:
-        return UNCATEGORIZED_FILTER_TOKEN in excluded_norms
-    return deal_category_norm in excluded_norms
+        return UNCATEGORIZED_FILTER_TOKEN
+    return deal_category_norm
+
+
+def is_deal_excluded_for_norms(excluded_norms: set[str], deal: Mapping[str, Any]) -> bool:
+    if not excluded_norms:
+        return False
+    return get_deal_category_token(deal) in excluded_norms
 
 
 def get_deal_category_for_display(deal: Mapping[str, Any]) -> str:

@@ -1,19 +1,50 @@
+from __future__ import annotations
+
 import sqlite3
 from pathlib import Path
+from typing import Iterable
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_FILE = BASE_DIR / "bot_state.db"
 DB_BUSY_TIMEOUT_MS = 5000
 
+# One long-lived connection: all access happens on the single event-loop
+# thread, so per-call connections (plus their PRAGMA round trips) are waste.
+_CONN: sqlite3.Connection | None = None
+
 
 def _connect() -> sqlite3.Connection:
+    global _CONN
+    if _CONN is not None:
+        return _CONN
+
     conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute(f"PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS}")
+    _CONN = conn
     return conn
+
+
+def close_db() -> None:
+    global _CONN
+    if _CONN is None:
+        return
+    try:
+        _CONN.commit()
+        _CONN.execute("PRAGMA optimize")
+        _CONN.close()
+    except sqlite3.Error:
+        pass
+    _CONN = None
+
+
+def vacuum_db() -> None:
+    conn = _connect()
+    conn.commit()
+    conn.execute("VACUUM")
 
 
 def validate_db_file_path_or_raise() -> None:
@@ -324,6 +355,17 @@ def _ensure_user_alert_keywords_schema(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE user_alert_keywords_new RENAME TO user_alert_keywords")
 
 
+def _ensure_meta_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+
+
 def _ensure_indexes(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -346,6 +388,7 @@ def init_db() -> None:
         _ensure_guild_excluded_categories_schema(conn)
         _ensure_guild_excluded_sites_schema(conn)
         _ensure_user_alert_keywords_schema(conn)
+        _ensure_meta_schema(conn)
         _ensure_indexes(conn)
         conn.execute("DROP TABLE IF EXISTS guild_enabled_sites")
         conn.commit()
@@ -542,6 +585,41 @@ def mark_deal_sent(deal_id: str) -> bool:
         )
         conn.commit()
     return cur.rowcount > 0
+
+
+def mark_deals_sent(deal_ids: Iterable[str]) -> int:
+    """Batch variant: one transaction for a whole cycle's worth of keys."""
+    rows = [(deal_id,) for deal_id in deal_ids if deal_id]
+    if not rows:
+        return 0
+    with _connect() as conn:
+        cur = conn.executemany(
+            "INSERT OR IGNORE INTO sent_deals (deal_id) VALUES (?)",
+            rows,
+        )
+        conn.commit()
+    return int(cur.rowcount)
+
+
+def get_meta_value(key: str) -> str | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_meta WHERE key = ?",
+            (str(key),),
+        ).fetchone()
+    return str(row["value"]) if row is not None else None
+
+
+def set_meta_value(key: str, value: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_meta (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (str(key), str(value)),
+        )
+        conn.commit()
 
 
 def replace_sent_deal_ids(deal_ids: set[str]) -> None:

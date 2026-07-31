@@ -1,7 +1,12 @@
-﻿import asyncio
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
+import sqlite3
 from pathlib import Path
 
 import discord
@@ -23,8 +28,13 @@ try:
         get_excluded_sites_autocomplete_choices,
         parse_excluded_sites_input,
     )
-    from .error_logging import get_audit_logger, get_error_logger
-    from .storage import validate_db_file_path_or_raise
+    from .error_logging import get_audit_logger, get_error_logger, get_runtime_logger
+    from .storage import (
+        close_db,
+        get_meta_value,
+        set_meta_value,
+        validate_db_file_path_or_raise,
+    )
     from .startup_lock import StartupLock, StartupLockError
 except ImportError:
     from bot_service import HotDealService
@@ -40,8 +50,13 @@ except ImportError:
         get_excluded_sites_autocomplete_choices,
         parse_excluded_sites_input,
     )
-    from error_logging import get_audit_logger, get_error_logger
-    from storage import validate_db_file_path_or_raise
+    from error_logging import get_audit_logger, get_error_logger, get_runtime_logger
+    from storage import (
+        close_db,
+        get_meta_value,
+        set_meta_value,
+        validate_db_file_path_or_raise,
+    )
     from startup_lock import StartupLock, StartupLockError
 
 ############################
@@ -54,13 +69,14 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN") or "YOUR_DISCORD_BOT_TOKEN_HERE"
 LOCK_FILE = BASE_DIR / "bot_startup.lock"
 error_logger = get_error_logger(BASE_DIR)
 audit_logger = get_audit_logger(BASE_DIR)
+runtime_logger = get_runtime_logger(BASE_DIR)
 
 FILTER_CATEGORY_INPUT_MAX_LEN = 200
 SITE_FILTER_INPUT_MAX_LEN = 200
 ALERT_KEYWORD_INPUT_MAX_LEN = 200
 ALERT_KEYWORD_MAX_ITEMS_PER_REQUEST = 20
 STARTUP_COMMAND_SYNC_TIMEOUT_SECONDS = 45.0
-STARTUP_PRUNE_TIMEOUT_SECONDS = 45.0
+COMMAND_TREE_HASH_META_KEY = "command_tree_hash"
 
 MODE_VALUE_ALIASES = {
     "view": "조회",
@@ -119,6 +135,22 @@ def validate_environment_paths_or_raise() -> None:
             "Detected nested env file under src/.env. "
             "Use project root .env only to avoid config confusion."
         )
+
+
+def compute_command_tree_hash() -> str | None:
+    """Stable hash of slash-command definitions, to skip redundant syncs."""
+    try:
+        serialized = []
+        for command in bot.tree.get_commands():
+            try:
+                serialized.append(command.to_dict(bot.tree))
+            except TypeError:
+                serialized.append(command.to_dict())  # older discord.py signature
+        payload = json.dumps(serialized, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    except Exception:
+        error_logger.exception("Failed to compute command tree hash.")
+        return None
 
 
 def parse_alert_keywords_input(
@@ -259,14 +291,17 @@ def build_help_embed(
         color=service.parse_embed_color("ff9900"),
     )
 
-    icon_url = "https://via.placeholder.com/150"
     author_name = "핫딜봇"
+    icon_url: str | None = None
     if bot_user is not None:
         icon_url = bot_user.display_avatar.url
         author_name = str(bot_user)
 
-    embed.set_author(name=author_name, icon_url=icon_url)
-    embed.set_thumbnail(url=icon_url)
+    if icon_url:
+        embed.set_author(name=author_name, icon_url=icon_url)
+        embed.set_thumbnail(url=icon_url)
+    else:
+        embed.set_author(name=author_name)
 
     embed.add_field(
         name="`/도움말`",
@@ -322,7 +357,6 @@ def build_help_embed(
             ),
             inline=False,
         )
-        
 
     embed.add_field(
         name="도움이 필요하신가요?",
@@ -330,106 +364,90 @@ def build_help_embed(
         inline=False,
     )
 
-    embed.set_footer(text="핫딜봇 베타 (ver. 2.1)")
+    embed.set_footer(text="핫딜봇 베타 (ver. 2.2)")
     return embed
+
 
 ############################
 # Bot Events
 ############################
 @bot.event
 async def on_ready():
-    print("[startup] on_ready begin")
-    print(f"{bot.user} (ID: {bot.user.id}) is online, searching for deals.")
-    print(r"""
- ___  ___  ________  _________  ________  _______   ________  ___
-|\  \|\  \|\   __  \|\___   ___\\   ___ \|\  ___ \ |\   __  \|\  \
-\ \  \\\  \ \  \|\  \|___ \  \_\ \  \_|\ \ \   __/|\ \  \|\  \ \  \
- \ \   __  \ \  \\\  \   \ \  \ \ \  \ \\ \ \  \_|/_\ \   __  \ \  \
-  \ \  \ \  \ \  \\\  \   \ \  \ \ \  \_\\ \ \  \_|\ \ \  \ \  \ \  \____
-   \ \__\ \__\ \_______\   \ \__\ \ \_______\ \_______\ \__\ \__\ \_______\
-    \|__|\|__|\|_______|    \|__|  \|_______|\|_______|\|__|\|__|\|_______|
-""")
+    runtime_logger.info("[startup] on_ready begin")
+    runtime_logger.info(
+        f"{bot.user} (ID: {bot.user.id}) is online, searching for deals."
+    )
 
     try:
         await bot.change_presence(
             status=discord.Status.online,
             activity=discord.Game(name="핫딜봇 베타 /도움말"),
         )
-        print("[startup] presence updated")
-    except Exception as e:
-        print(f"Failed to set bot presence: {e}")
+        runtime_logger.info("[startup] presence updated")
+    except Exception:
         error_logger.exception("Failed to set bot presence.")
 
     if not service.commands_synced:
+        tree_hash = compute_command_tree_hash()
+        stored_hash = None
         try:
-            print("[startup] syncing slash commands...")
-            synced = await asyncio.wait_for(
-                bot.tree.sync(),
-                timeout=STARTUP_COMMAND_SYNC_TIMEOUT_SECONDS,
-            )
+            stored_hash = get_meta_value(COMMAND_TREE_HASH_META_KEY)
+        except Exception:
+            error_logger.exception("Failed to read stored command tree hash.")
+
+        if tree_hash is not None and stored_hash == tree_hash:
             service.commands_synced = True
-            print(f"Synced {len(synced)} slash command(s).")
-            print("[startup] slash sync completed")
-        except asyncio.TimeoutError:
-            print(
-                "Slash command sync timed out during startup. "
-                "Continuing without blocking startup."
+            runtime_logger.info(
+                "[startup] command definitions unchanged; skipping slash sync"
             )
-            error_logger.error(
-                "Slash command sync timed out during startup. "
-                f"timeout={STARTUP_COMMAND_SYNC_TIMEOUT_SECONDS}s"
-            )
-        except Exception as e:
-            print(f"Failed to sync slash commands: {e}")
-            error_logger.exception("Failed to sync slash commands.")
+        else:
+            try:
+                runtime_logger.info("[startup] syncing slash commands...")
+                synced = await asyncio.wait_for(
+                    bot.tree.sync(),
+                    timeout=STARTUP_COMMAND_SYNC_TIMEOUT_SECONDS,
+                )
+                service.commands_synced = True
+                runtime_logger.info(f"Synced {len(synced)} slash command(s).")
+                if tree_hash is not None:
+                    try:
+                        set_meta_value(COMMAND_TREE_HASH_META_KEY, tree_hash)
+                    except Exception:
+                        error_logger.exception("Failed to store command tree hash.")
+            except asyncio.TimeoutError:
+                error_logger.error(
+                    "Slash command sync timed out during startup. "
+                    f"timeout={STARTUP_COMMAND_SYNC_TIMEOUT_SECONDS}s"
+                )
+            except Exception:
+                error_logger.exception("Failed to sync slash commands.")
 
     try:
         async with service.deal_state_lock:
             service.refresh_runtime_config()
-        print(
+        runtime_logger.info(
             "[startup] runtime config loaded: "
             f"channels={len(service.registered_channels)}, "
             f"filter-guilds={len(service.excluded_categories_by_guild)}, "
             f"site-filter-guilds={len(service.excluded_sites_by_guild)}"
         )
     except Exception:
-        print("Failed to refresh runtime config during startup.")
         error_logger.exception("Failed to refresh runtime config during startup.")
-
-    try:
-        async with service.deal_state_lock:
-            await asyncio.wait_for(
-                service.prune_stale_registered_channels("startup"),
-                timeout=STARTUP_PRUNE_TIMEOUT_SECONDS,
-            )
-        print("[startup] stale channel prune completed")
-    except asyncio.TimeoutError:
-        print(
-            "Stale channel prune timed out during startup. "
-            "Continuing startup."
-        )
-        error_logger.error(
-            "Stale channel prune timed out during startup. "
-            f"timeout={STARTUP_PRUNE_TIMEOUT_SECONDS}s"
-        )
-    except Exception:
-        print("Failed to prune stale channels during startup.")
-        error_logger.exception("Failed to prune stale channels during startup.")
 
     if not check_hot_deals.is_running():
         check_hot_deals.start()
-        print("[startup] check_hot_deals task started")
+        runtime_logger.info("[startup] check_hot_deals task started")
     else:
-        print("[startup] check_hot_deals task already running")
+        runtime_logger.info("[startup] check_hot_deals task already running")
 
-    print("[startup] on_ready complete")
+    runtime_logger.info("[startup] on_ready complete")
 
 
 @bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     async with service.deal_state_lock:
         if service.unregister_channel_by_channel_id(channel.id):
-            print(f"Removed deleted channel from DB: {channel.id}")
+            runtime_logger.info(f"Removed deleted channel from DB: {channel.id}")
 
 
 @bot.event
@@ -445,7 +463,9 @@ async def on_guild_remove(guild: discord.Guild):
             )
 
     if removed_count:
-        print(f"Removed {removed_count} channel(s) after guild removal: {guild.id}")
+        runtime_logger.info(
+            f"Removed {removed_count} channel(s) after guild removal: {guild.id}"
+        )
 
 
 ############################
@@ -454,163 +474,27 @@ async def on_guild_remove(guild: discord.Guild):
 @tasks.loop(minutes=1)
 async def check_hot_deals():
     """
-    Periodically fetches deals (in a thread) and posts new ones to the registered channels.
+    Delivery cycle in three phases:
+      1) plan  (lock): dedup fetched deals, compute recipients per new deal
+      2) send  (no lock): enrich new deals, deliver batched embeds + DMs
+      3) settle (lock): batch-mark successes, drop stale channels, cap retries
     """
     try:
-        async with service.deal_state_lock:
-            service.refresh_runtime_config()
-            service.maybe_purge_old_sent_deals()
-
         all_deals = await service.fetch_all_deals()
-        seen_in_cycle: set[str] = set()
 
-        for deal in all_deals:
-            deal_keys = service.get_deal_keys(deal)
-            if not deal_keys:
-                continue
+        async with service.deal_state_lock:
+            service.maybe_purge_old_sent_deals()
+            plan = service.build_delivery_plan(all_deals)
 
-            async with service.deal_state_lock:
-                if any(key in seen_in_cycle for key in deal_keys):
-                    continue
-                seen_in_cycle.update(deal_keys)
+        if not plan.items:
+            return
 
-                if any(key in service.posted_deal_ids for key in deal_keys):
-                    continue
+        await service.enrich_new_deals(plan.items)
+        outcomes, stale_channel_ids = await service.deliver_plan(plan)
 
-                alert_matches = service.get_alert_matches_for_deal(deal)
-
-                eligible_targets: list[tuple[int, int]] = []
-                if service.registered_channels:
-                    for target_guild_id, target_channel_id in service.registered_channels.items():
-                        if service.is_deal_excluded_for_guild(
-                            target_guild_id, deal
-                        ) or service.is_deal_site_excluded_for_guild(
-                            target_guild_id, deal
-                        ):
-                            continue
-                        eligible_targets.append((target_guild_id, target_channel_id))
-
-                if not eligible_targets and not alert_matches:
-                    service.mark_deal_as_seen(deal)
-                    continue
-
-            sent_to_any_channel = False
-            sent_to_any_alert_dm = False
-            stale_channel_ids: set[int] = set()
-            channel_success_count = 0
-            channel_retryable_failure_count = 0
-            channel_permanent_failure_count = 0
-            dm_success_count = 0
-            dm_retryable_failure_count = 0
-            dm_permanent_failure_count = 0
-            delivery_failure_reasons: list[str] = []
-
-            for target_guild_id, channel_id in eligible_targets:
-                async with service.deal_state_lock:
-                    current_channel_id = service.registered_channels.get(target_guild_id)
-                    if current_channel_id != channel_id:
-                        continue
-                    if service.is_deal_excluded_for_guild(
-                        target_guild_id, deal
-                    ) or service.is_deal_site_excluded_for_guild(
-                        target_guild_id, deal
-                    ):
-                        continue
-
-                channel = await service.resolve_channel(channel_id)
-                if channel is None:
-                    print(f"Could not find channel {channel_id}. Skipping...")
-                    channel_retryable_failure_count += 1
-                    delivery_failure_reasons.append(f"channel:{channel_id}:unresolved")
-                    if await service.is_registered_channel_stale(channel_id):
-                        stale_channel_ids.add(channel_id)
-                    continue
-
-                try:
-                    delivery_result = await service.send_deal_embed_with_retry(
-                        channel,
-                        deal,
-                        channel_id,
-                    )
-                    if delivery_result.success:
-                        sent_to_any_channel = True
-                        channel_success_count += 1
-                    else:
-                        if delivery_result.channel_stale:
-                            stale_channel_ids.add(channel_id)
-                            channel_permanent_failure_count += 1
-                        elif delivery_result.retryable_failure:
-                            channel_retryable_failure_count += 1
-                        else:
-                            channel_permanent_failure_count += 1
-                        if delivery_result.reason:
-                            delivery_failure_reasons.append(
-                                f"channel:{channel_id}:{delivery_result.reason}"
-                            )
-                except Exception as e:
-                    print(f"Error sending deal to channel {channel_id}: {e}")
-                    error_logger.exception(
-                        "Unexpected error while sending deal to channel. "
-                        f"channel_id={channel_id}"
-                    )
-                    channel_retryable_failure_count += 1
-                    delivery_failure_reasons.append(f"channel:{channel_id}:{type(e).__name__}")
-
-            for user_id, matched_keywords in alert_matches.items():
-                try:
-                    dm_result = await service.send_alert_dm(user_id, deal, matched_keywords)
-                    if dm_result.success:
-                        sent_to_any_alert_dm = True
-                        dm_success_count += 1
-                    else:
-                        if dm_result.retryable_failure:
-                            dm_retryable_failure_count += 1
-                        else:
-                            dm_permanent_failure_count += 1
-                        if dm_result.reason:
-                            delivery_failure_reasons.append(
-                                f"dm:{user_id}:{dm_result.reason}"
-                            )
-                except Exception as e:
-                    print(
-                        f"Unexpected error while sending keyword alert DM "
-                        f"to user {user_id}: {e}"
-                    )
-                    error_logger.exception(
-                        "Unexpected error while sending keyword alert DM. "
-                        f"user_id={user_id}"
-                    )
-                    dm_retryable_failure_count += 1
-                    delivery_failure_reasons.append(f"dm:{user_id}:{type(e).__name__}")
-
-            async with service.deal_state_lock:
-                for stale_channel_id in stale_channel_ids:
-                    if service.unregister_channel_by_channel_id(stale_channel_id):
-                        print(
-                            f"Removed stale channel from DB during send: "
-                            f"{stale_channel_id}"
-                        )
-
-                if sent_to_any_channel or sent_to_any_alert_dm:
-                    service.mark_deal_as_seen(deal)
-                else:
-                    print(
-                        f"No successful deliveries for {deal.get('id', 'unknown-id')}; "
-                        "retrying later."
-                    )
-                    print(
-                        "Delivery diagnostics: "
-                        f"channel_ok={channel_success_count}, "
-                        f"channel_retryable_fail={channel_retryable_failure_count}, "
-                        f"channel_permanent_fail={channel_permanent_failure_count}, "
-                        f"dm_ok={dm_success_count}, "
-                        f"dm_retryable_fail={dm_retryable_failure_count}, "
-                        f"dm_permanent_fail={dm_permanent_failure_count}, "
-                        f"reasons={';'.join(delivery_failure_reasons[:6])}"
-                    )
-
-    except Exception as e:
-        print(f"Error while fetching or sending deals: {e}")
+        async with service.deal_state_lock:
+            service.finalize_deliveries(outcomes, stale_channel_ids)
+    except Exception:
         error_logger.exception("Error while fetching or sending deals.")
 
 
@@ -629,8 +513,7 @@ async def help_command(interaction: discord.Interaction):
             embed=embed,
             ephemeral=True,
         )
-    except Exception as e:
-        print(f"Failed to run /help: {e}")
+    except Exception:
         error_logger.exception("Failed to run /help command.")
         await safe_send_interaction_message(
             interaction,
@@ -656,14 +539,6 @@ async def set_channel(interaction: discord.Interaction):
 
     guild_id = interaction.guild.id
     channel_id = interaction.channel.id
-    deferred = await safe_defer_interaction(interaction, ephemeral=True)
-    if not deferred:
-        await safe_send_interaction_message(
-            interaction,
-            content="`/채널등록` 실행 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
-            ephemeral=True,
-        )
-        return
 
     try:
         async with service.deal_state_lock:
@@ -701,56 +576,11 @@ async def set_channel(interaction: discord.Interaction):
                 )
                 return
 
-        current_deals = await service.fetch_all_deals()
-
-        async with service.deal_state_lock:
-            # Re-check after network I/O in case another command updated state.
-            existing_channel_id = service.registered_channels.get(guild_id)
-            if existing_channel_id == channel_id:
-                service.update_registered_guild_name(guild_id, interaction.guild.name)
-                log_admin_audit_event(
-                    interaction,
-                    action="setchannel.noop",
-                    details=f"guild_id={guild_id}, channel_id={channel_id}, reason=already_registered_recheck",
-                )
-                await safe_send_interaction_message(
-                    interaction,
-                    content="이미 이 채널이 등록되어 있습니다.",
-                    ephemeral=True,
-                )
-                return
-            if existing_channel_id is not None:
-                log_admin_audit_event(
-                    interaction,
-                    action="setchannel.rejected",
-                    details=(
-                        f"guild_id={guild_id}, channel_id={channel_id}, "
-                        f"reason=existing_channel_recheck:{existing_channel_id}"
-                    ),
-                )
-                await safe_send_interaction_message(
-                    interaction,
-                    content=(
-                        "이 서버에는 이미 등록된 채널이 있습니다 "
-                        f"(<#{existing_channel_id}>). 먼저 해당 채널에서 `/채널해제`를 실행한 뒤, "
-                        "원하는 채널에서 `/채널등록`을 실행해 주세요."
-                    ),
-                    ephemeral=True,
-                )
-                return
-
-            before_count = len(service.posted_deal_ids)
-            for deal in current_deals:
-                service.mark_deal_as_seen(deal)
-            primed_count = len(service.posted_deal_ids) - before_count
             service.register_channel(guild_id, channel_id, interaction.guild.name)
             log_admin_audit_event(
                 interaction,
                 action="setchannel.success",
-                details=(
-                    f"guild_id={guild_id}, channel_id={channel_id}, "
-                    f"primed_count={primed_count}"
-                ),
+                details=f"guild_id={guild_id}, channel_id={channel_id}",
             )
 
         await safe_send_interaction_message(
@@ -761,12 +591,8 @@ async def set_channel(interaction: discord.Interaction):
             ),
             ephemeral=True,
         )
-        print(
-            f"Channel {channel_id} registered. "
-            f"Primed {primed_count} existing deal key(s) as seen."
-        )
+        runtime_logger.info(f"Channel {channel_id} registered for guild {guild_id}.")
     except Exception as e:
-        print(f"Error registering channel {channel_id}: {e}")
         error_logger.exception(
             "Error registering channel with /setchannel. "
             f"guild_id={guild_id}, channel_id={channel_id}"
@@ -903,14 +729,15 @@ async def filter_command(
             current_norms = set()
             service.replace_excluded_categories_for_guild(guild_id, current_norms)
 
-        log_admin_audit_event(
-            interaction,
-            action="filter.success",
-            details=(
-                f"guild_id={guild_id}, mode={mode_value}, "
-                f"excluded_count={len(current_norms)}"
-            ),
-        )
+        if mode_value != "조회":
+            log_admin_audit_event(
+                interaction,
+                action="filter.success",
+                details=(
+                    f"guild_id={guild_id}, mode={mode_value}, "
+                    f"excluded_count={len(current_norms)}"
+                ),
+            )
 
     if mode_value == "조회":
         header = "현재 제외 카테고리입니다."
@@ -940,8 +767,7 @@ async def filter_category_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     try:
         return get_excluded_categories_autocomplete_choices(current)
-    except Exception as e:
-        print(f"Autocomplete error for /filter category: {e}")
+    except Exception:
         error_logger.exception("Autocomplete error for /filter category.")
         return []
 
@@ -1066,14 +892,15 @@ async def site_filter_command(
             current_site_codes = set()
             service.replace_excluded_sites_for_guild(guild_id, current_site_codes)
 
-        log_admin_audit_event(
-            interaction,
-            action="sitefilter.success",
-            details=(
-                f"guild_id={guild_id}, mode={mode_value}, "
-                f"excluded_site_count={len(current_site_codes)}"
-            ),
-        )
+        if mode_value != "조회":
+            log_admin_audit_event(
+                interaction,
+                action="sitefilter.success",
+                details=(
+                    f"guild_id={guild_id}, mode={mode_value}, "
+                    f"excluded_site_count={len(current_site_codes)}"
+                ),
+            )
 
     if mode_value == "조회":
         header = "현재 제외 사이트입니다."
@@ -1103,8 +930,7 @@ async def site_filter_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     try:
         return get_excluded_sites_autocomplete_choices(current)
-    except Exception as e:
-        print(f"Autocomplete error for /site-filter site: {e}")
+    except Exception:
         error_logger.exception("Autocomplete error for /site-filter site.")
         return []
 
@@ -1145,19 +971,6 @@ async def alert_command(
         )
         return
 
-    if mode_value in {"설정", "추가", "삭제", "초기화"}:
-        can_update, retry_after = service.check_alert_update_cooldown(user_id)
-        if not can_update:
-            await interaction.response.send_message(
-                embed=build_alert_response_embed(
-                    "요청이 너무 빠릅니다.",
-                    extra_lines=[f"{retry_after:.1f}초 후 다시 시도해 주세요."],
-                    is_error=True,
-                ),
-                ephemeral=True,
-            )
-            return
-
     if mode_value in {"설정", "추가", "삭제"} and (keyword is None or not keyword.strip()):
         await interaction.response.send_message(
             embed=build_alert_response_embed(
@@ -1169,7 +982,6 @@ async def alert_command(
         )
         return
 
-    parsed_keywords: list[str] = []
     parsed_keyword_rules: dict[str, str] = {}
     if mode_value in {"설정", "추가", "삭제"}:
         parsed_keywords, was_truncated = parse_alert_keywords_input(keyword)
@@ -1194,74 +1006,106 @@ async def alert_command(
             )
             return
 
-        too_short_or_long: list[str] = []
-        invalid_tokens: list[str] = []
-        abuse_tokens: list[str] = []
-        for raw_keyword in parsed_keywords:
-            keyword_len = len(raw_keyword)
-            if (
-                keyword_len < service.ALERT_KEYWORD_MIN_LEN
-                or keyword_len > service.ALERT_KEYWORD_MAX_LEN
-            ):
-                too_short_or_long.append(raw_keyword)
-                continue
+        if mode_value == "삭제":
+            # Deletion only needs normalization — stored keywords that are
+            # invalid under CURRENT add-rules must still be removable.
+            for raw_keyword in parsed_keywords:
+                keyword_norm = service.normalize_alert_text(raw_keyword)
+                if keyword_norm:
+                    parsed_keyword_rules[keyword_norm] = raw_keyword
 
-            rule = service.build_alert_rule(raw_keyword)
-            if rule is None:
-                invalid_tokens.append(raw_keyword)
-                continue
+            if not parsed_keyword_rules:
+                await interaction.response.send_message(
+                    embed=build_alert_response_embed(
+                        "유효한 키워드가 없어 처리할 수 없습니다.",
+                        is_error=True,
+                    ),
+                    ephemeral=True,
+                )
+                return
+        else:
+            too_short_or_long: list[str] = []
+            invalid_tokens: list[str] = []
+            abuse_tokens: list[str] = []
+            for raw_keyword in parsed_keywords:
+                keyword_len = len(raw_keyword)
+                if (
+                    keyword_len < service.ALERT_KEYWORD_MIN_LEN
+                    or keyword_len > service.ALERT_KEYWORD_MAX_LEN
+                ):
+                    too_short_or_long.append(raw_keyword)
+                    continue
 
-            abuse_reason = service.get_alert_keyword_abuse_reason(rule)
-            if abuse_reason is not None:
-                abuse_tokens.append(f"{raw_keyword} ({abuse_reason})")
-                continue
+                rule = service.build_alert_rule(raw_keyword)
+                if rule is None:
+                    invalid_tokens.append(raw_keyword)
+                    continue
 
-            parsed_keyword_rules[rule.keyword_norm] = rule.keyword_raw
+                abuse_reason = service.get_alert_keyword_abuse_reason(rule)
+                if abuse_reason is not None:
+                    abuse_tokens.append(f"{raw_keyword} ({abuse_reason})")
+                    continue
 
-        if too_short_or_long:
+                parsed_keyword_rules[rule.keyword_norm] = rule.keyword_raw
+
+            if too_short_or_long:
+                await interaction.response.send_message(
+                    embed=build_alert_response_embed(
+                        "키워드 길이 제한을 확인해 주세요.",
+                        extra_lines=[
+                            (
+                                f"허용 범위: "
+                                f"{service.ALERT_KEYWORD_MIN_LEN}~{service.ALERT_KEYWORD_MAX_LEN}자"
+                            ),
+                            f"제한 위반: {', '.join(too_short_or_long)}",
+                        ],
+                        is_error=True,
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if invalid_tokens:
+                await interaction.response.send_message(
+                    embed=build_alert_response_embed(
+                        "일부 키워드는 형식이 올바르지 않습니다.",
+                        extra_lines=[f"잘못된 값: {', '.join(invalid_tokens)}"],
+                        is_error=True,
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if abuse_tokens:
+                await interaction.response.send_message(
+                    embed=build_alert_response_embed(
+                        "일부 키워드는 과도하게 넓은 매칭으로 차단되었습니다.",
+                        extra_lines=[f"차단됨: {', '.join(abuse_tokens)}"],
+                        is_error=True,
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if mode_value == "설정" and len(parsed_keyword_rules) > service.ALERT_KEYWORD_MAX_COUNT:
+                await interaction.response.send_message(
+                    embed=build_alert_response_embed(
+                        "설정하려는 키워드 수가 제한을 초과합니다.",
+                        extra_lines=[f"최대 허용 개수: {service.ALERT_KEYWORD_MAX_COUNT}"],
+                        is_error=True,
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+    # Consume the cooldown only after validation passed, atomically.
+    if mode_value in {"설정", "추가", "삭제", "초기화"}:
+        can_update, retry_after = service.try_alert_update(user_id)
+        if not can_update:
             await interaction.response.send_message(
                 embed=build_alert_response_embed(
-                    "키워드 길이 제한을 확인해 주세요.",
-                    extra_lines=[
-                        (
-                            f"허용 범위: "
-                            f"{service.ALERT_KEYWORD_MIN_LEN}~{service.ALERT_KEYWORD_MAX_LEN}자"
-                        ),
-                        f"제한 위반: {', '.join(too_short_or_long)}",
-                    ],
-                    is_error=True,
-                ),
-                ephemeral=True,
-            )
-            return
-
-        if invalid_tokens:
-            await interaction.response.send_message(
-                embed=build_alert_response_embed(
-                    "일부 키워드는 형식이 올바르지 않습니다.",
-                    extra_lines=[f"잘못된 값: {', '.join(invalid_tokens)}"],
-                    is_error=True,
-                ),
-                ephemeral=True,
-            )
-            return
-
-        if abuse_tokens:
-            await interaction.response.send_message(
-                embed=build_alert_response_embed(
-                    "일부 키워드는 과도하게 넓은 매칭으로 차단되었습니다.",
-                    extra_lines=[f"차단됨: {', '.join(abuse_tokens)}"],
-                    is_error=True,
-                ),
-                ephemeral=True,
-            )
-            return
-
-        if mode_value == "설정" and len(parsed_keyword_rules) > service.ALERT_KEYWORD_MAX_COUNT:
-            await interaction.response.send_message(
-                embed=build_alert_response_embed(
-                    "설정하려는 키워드 수가 제한을 초과합니다.",
-                    extra_lines=[f"최대 허용 개수: {service.ALERT_KEYWORD_MAX_COUNT}"],
+                    "요청이 너무 빠릅니다.",
+                    extra_lines=[f"{retry_after:.1f}초 후 다시 시도해 주세요."],
                     is_error=True,
                 ),
                 ephemeral=True,
@@ -1299,7 +1143,6 @@ async def alert_command(
 
         if mode_value == "초기화":
             removed_count = service.clear_alert_keywords_for_user(user_id)
-            service.touch_alert_update(user_id)
             current_keywords = service.get_alert_keywords_for_user(user_id)
             await safe_send_interaction_message(
                 interaction,
@@ -1315,7 +1158,7 @@ async def alert_command(
         if mode_value == "추가":
             current_count = service.get_alert_keyword_count_for_user(user_id)
             newly_added_count = 0
-            for keyword_norm, keyword_raw in parsed_keyword_rules.items():
+            for keyword_norm in parsed_keyword_rules:
                 if not service.has_alert_keyword_norm_for_user(user_id, keyword_norm):
                     newly_added_count += 1
 
@@ -1342,7 +1185,6 @@ async def alert_command(
                     inserted_count += 1
 
             current_keywords = service.get_alert_keywords_for_user(user_id)
-            service.touch_alert_update(user_id)
             await safe_send_interaction_message(
                 interaction,
                 embed=build_alert_response_embed(
@@ -1360,7 +1202,6 @@ async def alert_command(
                 service.add_alert_rule_for_user(user_id, keyword_raw)
 
             current_keywords = service.get_alert_keywords_for_user(user_id)
-            service.touch_alert_update(user_id)
             await safe_send_interaction_message(
                 interaction,
                 embed=build_alert_response_embed(
@@ -1378,7 +1219,6 @@ async def alert_command(
                 removed_count += 1
 
         current_keywords = service.get_alert_keywords_for_user(user_id)
-        service.touch_alert_update(user_id)
         await safe_send_interaction_message(
             interaction,
             embed=build_alert_response_embed(
@@ -1411,8 +1251,7 @@ async def alert_keyword_autocomplete(
             choices.append(app_commands.Choice(name=keyword, value=keyword))
 
         return choices[:25]
-    except Exception as e:
-        print(f"Autocomplete error for /alert keyword: {e}")
+    except Exception:
         error_logger.exception("Autocomplete error for /alert keyword.")
         return []
 
@@ -1473,7 +1312,7 @@ async def remove_channel(interaction: discord.Interaction):
             "이제 이 서버로는 핫딜을 전송하지 않습니다.",
             ephemeral=True,
         )
-        print(
+        runtime_logger.info(
             f"Guild {guild_id} channel unregistered (channel_id={removed_channel_id})."
         )
     else:
@@ -1493,7 +1332,6 @@ async def help_command_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
 ):
-    print(f"Unhandled /help error: {error}")
     error_logger.error(f"Unhandled /help error: {error}")
     await safe_send_interaction_message(
         interaction,
@@ -1515,7 +1353,6 @@ async def set_channel_error(
         message = "이 명령어는 `서버 관리` 권한이 필요합니다."
     else:
         message = "`/채널등록` 실행 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
-        print(f"Unhandled /setchannel error: {error}")
         error_logger.error(f"Unhandled /setchannel error: {error}")
 
     await safe_send_interaction_message(
@@ -1538,7 +1375,6 @@ async def filter_command_error(
         message = "이 명령어는 `서버 관리` 권한이 필요합니다."
     else:
         message = "`/필터` 실행 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
-        print(f"Unhandled /filter error: {error}")
         error_logger.error(f"Unhandled /filter error: {error}")
 
     await safe_send_interaction_message(
@@ -1561,7 +1397,6 @@ async def site_filter_command_error(
         message = "이 명령어는 `서버 관리` 권한이 필요합니다."
     else:
         message = "`/사이트필터` 실행 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
-        print(f"Unhandled /site-filter error: {error}")
         error_logger.error(f"Unhandled /site-filter error: {error}")
 
     await safe_send_interaction_message(
@@ -1575,7 +1410,6 @@ async def site_filter_command_error(
 async def alert_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ):
-    print(f"Unhandled /alert error: {error}")
     error_logger.error(f"Unhandled /alert error: {error}")
 
     await safe_send_interaction_message(
@@ -1602,7 +1436,6 @@ async def remove_channel_error(
         message = "이 명령어는 `서버 관리` 권한이 필요합니다."
     else:
         message = "`/채널해제` 실행 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
-        print(f"Unhandled /removechannel error: {error}")
         error_logger.error(f"Unhandled /removechannel error: {error}")
 
     await safe_send_interaction_message(
@@ -1620,18 +1453,26 @@ def main() -> None:
         validated_token = validate_token_or_raise(TOKEN)
         validate_environment_paths_or_raise()
         with StartupLock(LOCK_FILE):
-            service.initialize_state()
-            bot.run(validated_token, log_level=logging.WARN)
-    except RuntimeError as e:
-        print(e)
-        error_logger.error(f"Startup configuration error: {e}")
+            try:
+                service.initialize_state()
+                bot.run(validated_token, log_level=logging.WARN)
+            finally:
+                close_db()
     except StartupLockError as e:
-        print(e)
+        runtime_logger.info(str(e))
         error_logger.error(f"Startup lock error: {e}")
+    except discord.LoginFailure as e:
+        runtime_logger.info(
+            "Discord rejected the bot token. Check DISCORD_BOT_TOKEN in .env."
+        )
+        error_logger.error(f"Discord login failure: {e}")
+    except sqlite3.Error as e:
+        runtime_logger.info(f"Database error during startup: {e}")
+        error_logger.exception("Database error during startup.")
+    except RuntimeError as e:
+        runtime_logger.info(str(e))
+        error_logger.error(f"Startup configuration error: {e}")
 
 
 if __name__ == "__main__":
     main()
-
-
-
