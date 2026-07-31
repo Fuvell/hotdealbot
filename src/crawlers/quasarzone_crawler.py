@@ -59,6 +59,22 @@ def normalize_quasar_category(raw_category: str) -> str:
     return QUASAR_CATEGORY_MAP.get(_normalize_category_token(text), "\uae30\ud0c0")
 
 
+def _upgrade_quasar_image_url(url: str) -> str:
+    """
+    The list page serves tiny blurred previews named 'thumb_<hash>.<ext>'.
+    The full-resolution image lives at the same CDN path without the
+    'thumb_' prefix, so upgrade the URL when the pattern matches.
+    """
+    text = str(url or "").strip().rstrip("?")
+    if not text:
+        return ""
+    if "quasarzone.com" in text:
+        head, sep, tail = text.rpartition("/")
+        if sep and tail.startswith("thumb_"):
+            return f"{head}/{tail[len('thumb_'):]}"
+    return text
+
+
 class QuasarzoneCrawler(BaseCrawler):
     def parsing(self, html: str) -> Dict[int, BaseArticle]:
         soup = make_soup(html)
@@ -100,11 +116,16 @@ class QuasarzoneCrawler(BaseCrawler):
             title = re.sub(r"^\[.*?\]\s*", "", raw_title)
 
             image_url = None
-            for _image_tag in row.select("img"):
+            candidate_tags = row.select("img.maxImg") or row.select("img")
+            for _image_tag in candidate_tags:
                 _src = _image_tag.attrs.get("src") or _image_tag.attrs.get("data-src")
-                if _src and "tangerine.png" not in _src:
-                    image_url = _src
-                    break
+                if not _src or "tangerine.png" in _src:
+                    continue
+                # Skip site chrome: store badges and user-level icons.
+                if "/store/" in _src or "/level/" in _src:
+                    continue
+                image_url = _upgrade_quasar_image_url(_src)
+                break
 
             if (_nick_tag := row.select_one(".nick")) is None or (
                 not _nick_tag.attrs.get("data-nick")
