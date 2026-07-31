@@ -395,25 +395,55 @@ def build_welcome_embed() -> discord.Embed:
 
 
 async def find_bot_inviter(guild: discord.Guild) -> discord.abc.User | None:
-    """Look up who added the bot via the guild audit log (needs permission)."""
+    """
+    Look up who added the bot via the guild audit log.
+
+    Discord exposes the inviter ONLY through the audit log, so this requires
+    the bot to have the View Audit Log permission in that guild (include it
+    in the invite link). Retries once because the bot_add entry can lag a
+    moment behind the join event.
+    """
     me = guild.me
-    if me is None or not me.guild_permissions.view_audit_log or bot.user is None:
+    if bot.user is None:
+        return None
+    if me is None or not me.guild_permissions.view_audit_log:
+        runtime_logger.info(
+            f"Inviter lookup skipped (no View Audit Log permission). "
+            f"guild_id={guild.id}; falling back to server owner."
+        )
         return None
 
-    try:
-        async for entry in guild.audit_logs(
-            action=discord.AuditLogAction.bot_add,
-            limit=20,
-        ):
-            target_id = getattr(entry.target, "id", None)
-            if target_id == bot.user.id and entry.user is not None:
-                return entry.user
-    except discord.Forbidden:
-        return None
-    except Exception:
-        error_logger.exception(
-            f"Failed to read audit log for inviter lookup. guild_id={guild.id}"
-        )
+    for attempt in range(2):
+        if attempt > 0:
+            await asyncio.sleep(2.0)
+        try:
+            async for entry in guild.audit_logs(
+                action=discord.AuditLogAction.bot_add,
+                limit=20,
+            ):
+                target_id = getattr(entry.target, "id", None)
+                if target_id == bot.user.id and entry.user is not None:
+                    runtime_logger.info(
+                        f"Inviter found via audit log: user {entry.user.id} "
+                        f"for guild {guild.id}."
+                    )
+                    return entry.user
+        except discord.Forbidden:
+            runtime_logger.info(
+                f"Inviter lookup denied by Discord (Forbidden). "
+                f"guild_id={guild.id}; falling back to server owner."
+            )
+            return None
+        except Exception:
+            error_logger.exception(
+                f"Failed to read audit log for inviter lookup. guild_id={guild.id}"
+            )
+            return None
+
+    runtime_logger.info(
+        f"No bot_add audit entry found for guild {guild.id}; "
+        "falling back to server owner."
+    )
     return None
 
 
@@ -427,7 +457,9 @@ async def on_guild_join(guild: discord.Guild):
         embed = build_welcome_embed()
 
         recipient = await find_bot_inviter(guild)
+        recipient_kind = "inviter"
         if recipient is None and guild.owner_id:
+            recipient_kind = "owner"
             recipient = bot.get_user(guild.owner_id)
             if recipient is None:
                 try:
@@ -439,7 +471,8 @@ async def on_guild_join(guild: discord.Guild):
             try:
                 await recipient.send(embed=embed)
                 runtime_logger.info(
-                    f"Sent welcome DM to user {recipient.id} for guild {guild.id}."
+                    f"Sent welcome DM to {recipient_kind} {recipient.id} "
+                    f"for guild {guild.id}."
                 )
                 return
             except discord.Forbidden:
