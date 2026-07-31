@@ -13,6 +13,20 @@ except ImportError:
 
 DETAIL_CACHE_MAX_ENTRIES = 500
 
+# Eomisae injects paid ad posts into the card list. Their title anchor holds
+# the raw ad-template placeholder (filled client-side by JS, never by us).
+AD_TITLE_PLACEHOLDERS = {"list_ad_link"}
+
+
+def _is_ad_card(card) -> bool:
+    """Ad cards carry an unclassed '광고' badge in the meta line."""
+    for span in card.select("p span"):
+        if span.get("class"):
+            continue
+        if span.get_text(" ", strip=True).startswith("광고"):
+            return True
+    return False
+
 try:
     from ..deal_key import encode_deal_key
 except ImportError:
@@ -207,6 +221,9 @@ class EomisaeCrawler(BaseCrawler):
 
         data: Dict[int, BaseArticle] = {}
         for card in cards:
+            if _is_ad_card(card):
+                continue
+
             title_link = card.select_one("h3 a.pjax[href]")
             if title_link is None:
                 title_link = card.select_one("a.pjax[href*='/fs/']")
@@ -220,7 +237,7 @@ class EomisaeCrawler(BaseCrawler):
             article_id = int(id_match.group(1))
 
             title = title_link.get_text(" ", strip=True)
-            if not title:
+            if not title or title in AD_TITLE_PLACEHOLDERS:
                 continue
 
             raw_category = ""
@@ -303,7 +320,7 @@ class EomisaeCrawler(BaseCrawler):
             article_id = int(id_match.group(1))
 
             title = title_link.get_text(" ", strip=True)
-            if not title:
+            if not title or title in AD_TITLE_PLACEHOLDERS:
                 continue
 
             raw_parts = list(title_cell.stripped_strings)
