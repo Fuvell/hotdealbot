@@ -368,9 +368,106 @@ def build_help_embed(
     return embed
 
 
+def build_welcome_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="핫딜봇을 추가해줘서 고마워요!",
+        description=(
+            "- 우선, 원하는 채널에서 `/채널등록` 명령어를 사용하여 핫딜봇을 가동시켜주세요!\n"
+            "- `/도움말` 명령어를 통해 핫딜봇이 지원하는 여러 기능도 확인해보세요.\n"
+            "- `/필터`, `/사이트필터`로 원하지 않는 카테고리/사이트를 제외할 수 있어요.\n"
+            "- `/알림`으로 키워드가 포함된 핫딜을 DM으로 받아볼 수도 있어요."
+        ),
+        color=service.parse_embed_color("ff9900"),
+    )
+
+    if bot.user is not None:
+        icon_url = bot.user.display_avatar.url
+        embed.set_author(name=str(bot.user), icon_url=icon_url)
+        embed.set_thumbnail(url=icon_url)
+
+    embed.add_field(
+        name="도움이 필요하신가요?",
+        value="[클릭](https://discord.gg/FAU8fhYVKz)",
+        inline=False,
+    )
+    embed.set_footer(text="핫딜봇 베타 (ver. 2.2)")
+    return embed
+
+
+async def find_bot_inviter(guild: discord.Guild) -> discord.abc.User | None:
+    """Look up who added the bot via the guild audit log (needs permission)."""
+    me = guild.me
+    if me is None or not me.guild_permissions.view_audit_log or bot.user is None:
+        return None
+
+    try:
+        async for entry in guild.audit_logs(
+            action=discord.AuditLogAction.bot_add,
+            limit=20,
+        ):
+            target_id = getattr(entry.target, "id", None)
+            if target_id == bot.user.id and entry.user is not None:
+                return entry.user
+    except discord.Forbidden:
+        return None
+    except Exception:
+        error_logger.exception(
+            f"Failed to read audit log for inviter lookup. guild_id={guild.id}"
+        )
+    return None
+
+
 ############################
 # Bot Events
 ############################
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    runtime_logger.info(f"Joined guild {guild.id} ({guild.name}).")
+    try:
+        embed = build_welcome_embed()
+
+        recipient = await find_bot_inviter(guild)
+        if recipient is None and guild.owner_id:
+            recipient = bot.get_user(guild.owner_id)
+            if recipient is None:
+                try:
+                    recipient = await bot.fetch_user(guild.owner_id)
+                except discord.HTTPException:
+                    recipient = None
+
+        if recipient is not None and not recipient.bot:
+            try:
+                await recipient.send(embed=embed)
+                runtime_logger.info(
+                    f"Sent welcome DM to user {recipient.id} for guild {guild.id}."
+                )
+                return
+            except discord.Forbidden:
+                pass  # DMs closed; fall back to a server channel below.
+            except discord.HTTPException as e:
+                error_logger.error(
+                    f"Failed to send welcome DM. guild_id={guild.id}, "
+                    f"user_id={recipient.id}, error={e}"
+                )
+
+        system_channel = guild.system_channel
+        if (
+            system_channel is not None
+            and guild.me is not None
+            and system_channel.permissions_for(guild.me).send_messages
+        ):
+            await system_channel.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            runtime_logger.info(
+                f"Sent welcome message to system channel for guild {guild.id}."
+            )
+    except Exception:
+        error_logger.exception(f"Failed to send welcome message. guild_id={guild.id}")
+
+
+
 @bot.event
 async def on_ready():
     runtime_logger.info("[startup] on_ready begin")
