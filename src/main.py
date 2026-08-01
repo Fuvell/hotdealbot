@@ -394,59 +394,6 @@ def build_welcome_embed() -> discord.Embed:
     return embed
 
 
-async def find_bot_inviter(guild: discord.Guild) -> discord.abc.User | None:
-    """
-    Look up who added the bot via the guild audit log.
-
-    Discord exposes the inviter ONLY through the audit log, so this requires
-    the bot to have the View Audit Log permission in that guild (include it
-    in the invite link). Retries once because the bot_add entry can lag a
-    moment behind the join event.
-    """
-    me = guild.me
-    if bot.user is None:
-        return None
-    if me is None or not me.guild_permissions.view_audit_log:
-        runtime_logger.info(
-            f"Inviter lookup skipped (no View Audit Log permission). "
-            f"guild_id={guild.id}; falling back to server owner."
-        )
-        return None
-
-    for attempt in range(2):
-        if attempt > 0:
-            await asyncio.sleep(2.0)
-        try:
-            async for entry in guild.audit_logs(
-                action=discord.AuditLogAction.bot_add,
-                limit=20,
-            ):
-                target_id = getattr(entry.target, "id", None)
-                if target_id == bot.user.id and entry.user is not None:
-                    runtime_logger.info(
-                        f"Inviter found via audit log: user {entry.user.id} "
-                        f"for guild {guild.id}."
-                    )
-                    return entry.user
-        except discord.Forbidden:
-            runtime_logger.info(
-                f"Inviter lookup denied by Discord (Forbidden). "
-                f"guild_id={guild.id}; falling back to server owner."
-            )
-            return None
-        except Exception:
-            error_logger.exception(
-                f"Failed to read audit log for inviter lookup. guild_id={guild.id}"
-            )
-            return None
-
-    runtime_logger.info(
-        f"No bot_add audit entry found for guild {guild.id}; "
-        "falling back to server owner."
-    )
-    return None
-
-
 ############################
 # Bot Events
 ############################
@@ -456,46 +403,37 @@ async def on_guild_join(guild: discord.Guild):
     try:
         embed = build_welcome_embed()
 
-        recipient = await find_bot_inviter(guild)
-        recipient_kind = "inviter"
-        if recipient is None and guild.owner_id:
-            recipient_kind = "owner"
-            recipient = bot.get_user(guild.owner_id)
-            if recipient is None:
-                try:
-                    recipient = await bot.fetch_user(guild.owner_id)
-                except discord.HTTPException:
-                    recipient = None
+        target_channel = None
+        me = guild.me
+        if me is not None:
+            system_channel = guild.system_channel
+            if (
+                system_channel is not None
+                and system_channel.permissions_for(me).send_messages
+            ):
+                target_channel = system_channel
+            else:
+                # No usable system channel: fall back to the first text
+                # channel the bot is allowed to write in.
+                for channel in guild.text_channels:
+                    if channel.permissions_for(me).send_messages:
+                        target_channel = channel
+                        break
 
-        if recipient is not None and not recipient.bot:
-            try:
-                await recipient.send(embed=embed)
-                runtime_logger.info(
-                    f"Sent welcome DM to {recipient_kind} {recipient.id} "
-                    f"for guild {guild.id}."
-                )
-                return
-            except discord.Forbidden:
-                pass  # DMs closed; fall back to a server channel below.
-            except discord.HTTPException as e:
-                error_logger.error(
-                    f"Failed to send welcome DM. guild_id={guild.id}, "
-                    f"user_id={recipient.id}, error={e}"
-                )
-
-        system_channel = guild.system_channel
-        if (
-            system_channel is not None
-            and guild.me is not None
-            and system_channel.permissions_for(guild.me).send_messages
-        ):
-            await system_channel.send(
-                embed=embed,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+        if target_channel is None:
             runtime_logger.info(
-                f"Sent welcome message to system channel for guild {guild.id}."
+                f"No writable channel for welcome message. guild_id={guild.id}"
             )
+            return
+
+        await target_channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        runtime_logger.info(
+            f"Sent welcome message to channel {target_channel.id} "
+            f"for guild {guild.id}."
+        )
     except Exception:
         error_logger.exception(f"Failed to send welcome message. guild_id={guild.id}")
 
