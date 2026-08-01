@@ -28,12 +28,9 @@ PPOMPPU_DESKTOP_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
-# google.com/s2/favicons 404s for ppomppu.co.kr; the gstatic faviconV2
-# endpoint serves a real PNG directly (verified 200 image/png).
 PPOMPPU_LOGO_URL = (
-    "https://t1.gstatic.com/faviconV2"
-    "?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL"
-    "&url=https://www.ppomppu.co.kr&size=64"
+    "https://encrypted-tbn0.gstatic.com/images"
+    "?q=tbn:ANd9GcRq_dckSZnyzS9c4JE-uVLM9t7uWs_x59ldasbqxOETwg3bw66lIqHF0bDo&s=10"
 )
 
 
