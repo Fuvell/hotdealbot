@@ -960,6 +960,15 @@ class HotDealService:
         if keys_to_mark:
             mark_deals_sent(keys_to_mark)
 
+        # Success summary: without this, a healthy-but-quiet bot is
+        # indistinguishable from a broken one in the logs.
+        delivered_count = sum(1 for outcome in outcomes if outcome.delivered)
+        if delivered_count:
+            self.runtime_metrics["deals_delivered_total"] += delivered_count
+            runtime_logger.info(
+                f"Cycle complete: delivered {delivered_count} new deal(s)."
+            )
+
     ############################
     # Discord send primitives
     ############################
