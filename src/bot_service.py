@@ -38,8 +38,10 @@ try:
     )
     from .crawlers.quasarzone_crawler import fetch_hot_deals
     from .error_logging import get_error_logger, get_runtime_logger
+    from .price_parse import parse_price
     from .storage import (
         init_db,
+        insert_deal_history_rows,
         load_excluded_categories_by_guild,
         load_excluded_sites_by_guild,
         load_registered_channels,
@@ -81,8 +83,10 @@ except ImportError:
     )
     from crawlers.quasarzone_crawler import fetch_hot_deals
     from error_logging import get_error_logger, get_runtime_logger
+    from price_parse import parse_price
     from storage import (
         init_db,
+        insert_deal_history_rows,
         load_excluded_categories_by_guild,
         load_excluded_sites_by_guild,
         load_registered_channels,
@@ -604,6 +608,7 @@ class HotDealService:
         new_count_by_site: dict[str, int] = defaultdict(int)
         burst_skipped_by_site: dict[str, int] = defaultdict(int)
         keys_to_mark: list[str] = []
+        history_rows: list[dict[str, Any]] = []
 
         for deal in all_deals:
             lookup_keys = self.get_deal_keys(deal)
@@ -620,6 +625,29 @@ class HotDealService:
             storage_key = get_storage_key_for_deal(deal)
             site_code = get_deal_site_code(deal) or str(deal.get("site_code", "") or "")
             category_token = get_deal_category_token(deal)
+
+            # Analytics capture: record EVERY new deal (even ones that end up
+            # burst-capped or undelivered) — see docs/DATA_PLATFORM_PLAN.md.
+            if storage_key:
+                price_raw = str(deal.get("price", "") or "").strip()
+                price_amount, currency = parse_price(price_raw)
+                if price_amount is None:
+                    price_amount, currency = parse_price(
+                        str(deal.get("title", "") or "")
+                    )
+                history_rows.append(
+                    {
+                        "deal_key": storage_key,
+                        "site_code": site_code,
+                        "title": str(deal.get("title", "") or ""),
+                        "category": str(deal.get("category", "") or ""),
+                        "price_raw": price_raw,
+                        "price_amount": price_amount,
+                        "currency": currency,
+                        "url": str(deal.get("url", "") or ""),
+                        "image_url": str(deal.get("image_url", "") or ""),
+                    }
+                )
 
             new_count_by_site[site_code] += 1
             if new_count_by_site[site_code] > self.MAX_NEW_DEALS_PER_SITE_PER_CYCLE:
@@ -657,6 +685,14 @@ class HotDealService:
 
         if keys_to_mark:
             mark_deals_sent(keys_to_mark)
+
+        if history_rows:
+            try:
+                inserted = insert_deal_history_rows(history_rows)
+                if inserted:
+                    self.runtime_metrics["deal_history_rows_total"] += inserted
+            except Exception:
+                error_logger.exception("Failed to record deal history rows.")
 
         for site, skipped_count in burst_skipped_by_site.items():
             runtime_logger.info(

@@ -355,6 +355,39 @@ def _ensure_user_alert_keywords_schema(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE user_alert_keywords_new RENAME TO user_alert_keywords")
 
 
+def _ensure_deal_history_schema(conn: sqlite3.Connection) -> None:
+    # Append-only raw capture of every new deal, feeding the future price
+    # analytics site (docs/DATA_PLATFORM_PLAN.md). Never purged.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS deal_history (
+            deal_key TEXT PRIMARY KEY,
+            site_code TEXT NOT NULL,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT '',
+            price_raw TEXT NOT NULL DEFAULT '',
+            price_amount REAL,
+            currency TEXT NOT NULL DEFAULT '',
+            url TEXT NOT NULL DEFAULT '',
+            image_url TEXT NOT NULL DEFAULT '',
+            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_deal_history_site_seen
+        ON deal_history(site_code, first_seen_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_deal_history_first_seen
+        ON deal_history(first_seen_at)
+        """
+    )
+
+
 def _ensure_meta_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -388,6 +421,7 @@ def init_db() -> None:
         _ensure_guild_excluded_categories_schema(conn)
         _ensure_guild_excluded_sites_schema(conn)
         _ensure_user_alert_keywords_schema(conn)
+        _ensure_deal_history_schema(conn)
         _ensure_meta_schema(conn)
         _ensure_indexes(conn)
         conn.execute("DROP TABLE IF EXISTS guild_enabled_sites")
@@ -596,6 +630,44 @@ def mark_deals_sent(deal_ids: Iterable[str]) -> int:
         cur = conn.executemany(
             "INSERT OR IGNORE INTO sent_deals (deal_id) VALUES (?)",
             rows,
+        )
+        conn.commit()
+    return int(cur.rowcount)
+
+
+def insert_deal_history_rows(rows: list[dict]) -> int:
+    """
+    Append raw deal records for analytics capture. Each row dict needs:
+    deal_key, site_code, title, category, price_raw, price_amount (float|None),
+    currency, url, image_url. Duplicate keys are ignored (append-only).
+    """
+    values = [
+        (
+            str(row.get("deal_key", "")),
+            str(row.get("site_code", "")),
+            str(row.get("title", "")),
+            str(row.get("category", "") or ""),
+            str(row.get("price_raw", "") or ""),
+            row.get("price_amount"),
+            str(row.get("currency", "") or ""),
+            str(row.get("url", "") or ""),
+            str(row.get("image_url", "") or ""),
+        )
+        for row in rows
+        if row.get("deal_key") and row.get("site_code") and row.get("title")
+    ]
+    if not values:
+        return 0
+
+    with _connect() as conn:
+        cur = conn.executemany(
+            """
+            INSERT OR IGNORE INTO deal_history (
+                deal_key, site_code, title, category,
+                price_raw, price_amount, currency, url, image_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
         )
         conn.commit()
     return int(cur.rowcount)
