@@ -34,7 +34,12 @@ FMKOREA_DESKTOP_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
-FMKOREA_LOGO_URL = "https://www.google.com/s2/favicons?domain=fmkorea.com&sz=64"
+# Serve the icon PNG directly from gstatic (no redirect hop for Discord).
+FMKOREA_LOGO_URL = (
+    "https://t1.gstatic.com/faviconV2"
+    "?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL"
+    "&url=https://www.fmkorea.com&size=64"
+)
 PLAYWRIGHT_COOLDOWN_SECONDS = 300.0
 DETAIL_CACHE_MAX_ENTRIES = 500
 

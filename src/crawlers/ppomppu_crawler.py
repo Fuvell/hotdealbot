@@ -28,7 +28,13 @@ PPOMPPU_DESKTOP_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
-PPOMPPU_LOGO_URL = "https://www.google.com/s2/favicons?domain=ppomppu.co.kr&sz=64"
+# google.com/s2/favicons 404s for ppomppu.co.kr; the gstatic faviconV2
+# endpoint serves a real PNG directly (verified 200 image/png).
+PPOMPPU_LOGO_URL = (
+    "https://t1.gstatic.com/faviconV2"
+    "?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL"
+    "&url=https://www.ppomppu.co.kr&size=64"
+)
 
 
 def _normalize_category_token(raw: str) -> str:
