@@ -44,6 +44,20 @@ CLEAR_ALL_FILTER_INPUT_NORMS = {
     normalize_category_token("초기화"),
 }
 
+# Tokens that expand to EVERY filterable category (전체 제외 — the opposite
+# of 없음/전체 허용).
+SELECT_ALL_FILTER_INPUT_NORMS = {
+    normalize_category_token("전체"),
+    normalize_category_token("전부"),
+    normalize_category_token("모두"),
+    normalize_category_token("all"),
+    normalize_category_token("everything"),
+}
+ALL_CATEGORY_NORMS = {
+    normalize_category_token(category) for category in COMMON_FILTERABLE_CATEGORIES
+} | {UNCATEGORIZED_FILTER_TOKEN}
+SELECT_ALL_DISPLAY = "전체"
+
 DISPLAY_CATEGORY_BY_NORM = {
     normalize_category_token(category): category
     for category in COMMON_FILTERABLE_CATEGORIES
@@ -115,6 +129,9 @@ def parse_excluded_categories_input(raw: str | None) -> tuple[set[str], list[str
     parsed_norms: set[str] = set()
     unknown_tokens: list[str] = []
     for token in tokens:
+        if normalize_category_token(token) in SELECT_ALL_FILTER_INPUT_NORMS:
+            parsed_norms |= ALL_CATEGORY_NORMS
+            continue
         canonical_norm = canonicalize_category_input_token(token)
         if canonical_norm is None:
             unknown_tokens.append(token)
@@ -162,6 +179,15 @@ def get_excluded_categories_autocomplete_choices(
                         value=value,
                     )
                 )
+
+    if (
+        not current_text
+        or "all".startswith(prefix_norm)
+        or normalize_category_token(SELECT_ALL_DISPLAY).startswith(prefix_norm)
+    ):
+        choices.append(
+            app_commands.Choice(name="전체 (모든 카테고리 제외)", value=SELECT_ALL_DISPLAY)
+        )
 
     if (
         not current_text

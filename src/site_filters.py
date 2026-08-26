@@ -59,6 +59,18 @@ CLEAR_ALL_FILTER_INPUT_NORMS = {
     normalize_site_token("\ucd08\uae30\ud654"),
 }
 
+# Tokens that expand to EVERY filterable site (\uc804\uccb4 \uc81c\uc678 \u2014 the opposite of
+# \uc5c6\uc74c/\uc804\uccb4 \ud5c8\uc6a9).
+SELECT_ALL_FILTER_INPUT_NORMS = {
+    normalize_site_token("\uc804\uccb4"),
+    normalize_site_token("\uc804\ubd80"),
+    normalize_site_token("\ubaa8\ub450"),
+    normalize_site_token("all"),
+    normalize_site_token("everything"),
+}
+ALL_SITE_CODES = {code for code, _ in FILTERABLE_SITES}
+SELECT_ALL_DISPLAY = "\uc804\uccb4"
+
 
 def format_filterable_sites_for_help() -> str:
     return ", ".join(display for _, display in FILTERABLE_SITES)
@@ -114,6 +126,9 @@ def parse_excluded_sites_input(raw: str | None) -> tuple[set[str], list[str]]:
     unknown_tokens: list[str] = []
 
     for token in tokens:
+        if normalize_site_token(token) in SELECT_ALL_FILTER_INPUT_NORMS:
+            parsed_codes |= ALL_SITE_CODES
+            continue
         canonical_code = canonicalize_site_input_token(token)
         if canonical_code is None:
             unknown_tokens.append(token)
@@ -151,6 +166,18 @@ def get_excluded_sites_autocomplete_choices(
         if len(value) > 100:
             continue
         choices.append(app_commands.Choice(name=display, value=value))
+
+    if (
+        not current_text
+        or "all".startswith(prefix_norm)
+        or normalize_site_token(SELECT_ALL_DISPLAY).startswith(prefix_norm)
+    ):
+        choices.append(
+            app_commands.Choice(
+                name="\uc804\uccb4 (\ubaa8\ub4e0 \uc0ac\uc774\ud2b8 \uc81c\uc678)",
+                value=SELECT_ALL_DISPLAY,
+            )
+        )
 
     if (
         not current_text
