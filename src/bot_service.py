@@ -221,8 +221,12 @@ class HotDealService:
     DISCORD_API_CHECK_TIMEOUT_SECONDS = 10.0
     ENRICH_TIMEOUT_SECONDS = 15.0
     EMBEDS_PER_MESSAGE = 10
-    # Sites whose image CDNs block Discord's proxy: re-host via attachment.
-    IMAGE_ATTACH_SITE_CODES = {"quasarzone", "arcalive"}
+    # Sites whose image URLs don't survive as embed thumbnails, verified by
+    # end-to-end Discord tests: quasarzone (Discord's serving proxy 404s on
+    # their CDN), arcalive (signed URLs expire after ~1-2h), fmkorea
+    # (preemptive: most aggressive anti-bot of the five). Their images are
+    # downloaded and re-hosted as message attachments instead.
+    IMAGE_ATTACH_SITE_CODES = {"quasarzone", "arcalive", "fmkorea"}
     # Flood guard: max new deals accepted per site per cycle; the overflow is
     # marked seen without posting (protects channels after outages/first runs).
     MAX_NEW_DEALS_PER_SITE_PER_CYCLE = 10
@@ -779,10 +783,10 @@ class HotDealService:
         loop: asyncio.AbstractEventLoop,
     ) -> None:
         """
-        Some CDNs (quasarzone, arca) serve images to us but block Discord's
-        image-proxy IPs, so URL thumbnails render blank. For those sites the
-        bot downloads the image and ships it as a message attachment
-        (attachment://...), which Discord serves itself.
+        For sites in IMAGE_ATTACH_SITE_CODES, URL thumbnails fail through
+        Discord (proxy 404s or the URL itself expires — see the constant's
+        comment), so the bot downloads the image and ships it as a message
+        attachment (attachment://...), which Discord hosts permanently.
         """
         site_code = str(item.deal.get("site_code", "") or "")
         if site_code not in self.IMAGE_ATTACH_SITE_CODES:
