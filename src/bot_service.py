@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import re
 import unicodedata
+import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -116,6 +118,44 @@ DEAL_ENRICHERS: dict[str, Callable[[dict], None]] = {
     "eomisae": enrich_deal_eomisae,
 }
 
+_IMAGE_DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024  # Discord bot upload limit.
+_IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 10
+_IMAGE_EXTENSION_BY_CONTENT_TYPE = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+_IMAGE_DOWNLOAD_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+
+def _download_image_sync(url: str, referer: str) -> tuple[bytes | None, str]:
+    """Download an image for re-hosting as a Discord attachment."""
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": _IMAGE_DOWNLOAD_USER_AGENT, "Referer": referer},
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=_IMAGE_DOWNLOAD_TIMEOUT_SECONDS
+        ) as response:
+            content_type = (
+                str(response.headers.get("Content-Type", "")).split(";")[0].strip().lower()
+            )
+            if not content_type.startswith("image/"):
+                return None, ""
+            data = response.read(_IMAGE_DOWNLOAD_MAX_BYTES + 1)
+            if not data or len(data) > _IMAGE_DOWNLOAD_MAX_BYTES:
+                return None, ""
+            return data, content_type
+    except Exception:
+        return None, ""
+
 
 @dataclass(frozen=True)
 class AlertKeywordRule:
@@ -181,6 +221,8 @@ class HotDealService:
     DISCORD_API_CHECK_TIMEOUT_SECONDS = 10.0
     ENRICH_TIMEOUT_SECONDS = 15.0
     EMBEDS_PER_MESSAGE = 10
+    # Sites whose image CDNs block Discord's proxy: re-host via attachment.
+    IMAGE_ATTACH_SITE_CODES = {"quasarzone", "arcalive"}
     # Flood guard: max new deals accepted per site per cycle; the overflow is
     # marked seen without posting (protects channels after outages/first runs).
     MAX_NEW_DEALS_PER_SITE_PER_CYCLE = 10
@@ -709,26 +751,67 @@ class HotDealService:
         async def _enrich_one(item: PlannedDeal) -> None:
             site_code = str(item.deal.get("site_code", "") or "")
             enricher = DEAL_ENRICHERS.get(site_code)
-            if enricher is None:
-                return
-            try:
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, enricher, item.deal),
-                    timeout=self.ENRICH_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                runtime_logger.info(
-                    f"Deal enrichment timed out. site={site_code}, "
-                    f"id={item.deal.get('id', 'unknown')}"
-                )
-            except Exception:
-                error_logger.exception(
-                    f"Deal enrichment failed. site={site_code}, "
-                    f"id={item.deal.get('id', 'unknown')}"
-                )
+            if enricher is not None:
+                try:
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, enricher, item.deal),
+                        timeout=self.ENRICH_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    runtime_logger.info(
+                        f"Deal enrichment timed out. site={site_code}, "
+                        f"id={item.deal.get('id', 'unknown')}"
+                    )
+                except Exception:
+                    error_logger.exception(
+                        f"Deal enrichment failed. site={site_code}, "
+                        f"id={item.deal.get('id', 'unknown')}"
+                    )
+
+            await self._attach_image_if_needed(item, loop)
 
         if items:
             await asyncio.gather(*(_enrich_one(item) for item in items))
+
+    async def _attach_image_if_needed(
+        self,
+        item: PlannedDeal,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """
+        Some CDNs (quasarzone, arca) serve images to us but block Discord's
+        image-proxy IPs, so URL thumbnails render blank. For those sites the
+        bot downloads the image and ships it as a message attachment
+        (attachment://...), which Discord serves itself.
+        """
+        site_code = str(item.deal.get("site_code", "") or "")
+        if site_code not in self.IMAGE_ATTACH_SITE_CODES:
+            return
+
+        image_url = str(item.deal.get("image_url", "") or "").strip()
+        if not self._looks_like_web_url(image_url):
+            return
+
+        referer = str(item.deal.get("url", "") or "") or image_url
+        try:
+            data, content_type = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, _download_image_sync, image_url, referer
+                ),
+                timeout=self.ENRICH_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return  # Fall back to the URL thumbnail; may still render.
+
+        if not data:
+            return
+
+        extension = _IMAGE_EXTENSION_BY_CONTENT_TYPE.get(content_type, "jpg")
+        key_slug = re.sub(r"[^a-zA-Z0-9]", "", str(item.storage_key or ""))[:40]
+        if not key_slug:
+            return
+        item.deal["image_bytes"] = data
+        item.deal["image_filename"] = f"t_{key_slug}.{extension}"
 
     async def deliver_plan(
         self,
@@ -795,7 +878,12 @@ class HotDealService:
             for start in range(0, len(sendable), batch_size):
                 chunk = sendable[start:start + batch_size]
                 embeds = [self.build_deal_embed(item.deal) for item in chunk]
-                result = await self.send_embeds_with_retry(channel, embeds, channel_id)
+                result = await self.send_embeds_with_retry(
+                    channel,
+                    embeds,
+                    channel_id,
+                    attachments=self.build_attachment_specs(chunk),
+                )
 
                 if result.success:
                     for item in chunk:
@@ -815,7 +903,10 @@ class HotDealService:
                     # by falling back to individual sends.
                     for item, embed in zip(chunk, embeds):
                         single = await self.send_embeds_with_retry(
-                            channel, [embed], channel_id
+                            channel,
+                            [embed],
+                            channel_id,
+                            attachments=self.build_attachment_specs([item]),
                         )
                         outcome = outcomes[id(item)]
                         if single.success:
@@ -972,11 +1063,24 @@ class HotDealService:
     ############################
     # Discord send primitives
     ############################
+    @staticmethod
+    def build_attachment_specs(
+        items: list[PlannedDeal],
+    ) -> list[tuple[str, bytes]]:
+        specs: list[tuple[str, bytes]] = []
+        for item in items:
+            filename = str(item.deal.get("image_filename", "") or "")
+            data = item.deal.get("image_bytes")
+            if filename and isinstance(data, bytes):
+                specs.append((filename, data))
+        return specs
+
     async def send_embeds_with_retry(
         self,
         channel: Any,
         embeds: list[discord.Embed],
         channel_id: int,
+        attachments: list[tuple[str, bytes]] | None = None,
     ) -> DeliveryResult:
         delays = (0.0, *self.DISCORD_SEND_RETRY_DELAYS_SECONDS)
 
@@ -985,10 +1089,17 @@ class HotDealService:
                 await asyncio.sleep(delay)
 
             try:
-                await channel.send(
-                    embeds=embeds,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+                send_kwargs: dict[str, Any] = {
+                    "embeds": embeds,
+                    "allowed_mentions": discord.AllowedMentions.none(),
+                }
+                if attachments:
+                    # discord.File streams are consumed on send; rebuild per attempt.
+                    send_kwargs["files"] = [
+                        discord.File(io.BytesIO(data), filename=filename)
+                        for filename, data in attachments
+                    ]
+                await channel.send(**send_kwargs)
                 return DeliveryResult(success=True, reason="sent")
             except (discord.NotFound, discord.Forbidden) as e:
                 error_logger.error(
@@ -1110,10 +1221,20 @@ class HotDealService:
 
             try:
                 embed = self.build_deal_embed(deal)
-                await user.send(
-                    embed=embed,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+                send_kwargs: dict[str, Any] = {
+                    "embed": embed,
+                    "allowed_mentions": discord.AllowedMentions.none(),
+                }
+                attachment_filename = str(deal.get("image_filename", "") or "")
+                attachment_data = deal.get("image_bytes")
+                if attachment_filename and isinstance(attachment_data, bytes):
+                    send_kwargs["files"] = [
+                        discord.File(
+                            io.BytesIO(attachment_data),
+                            filename=attachment_filename,
+                        )
+                    ]
+                await user.send(**send_kwargs)
                 self._record_alert_dm_sent(user_id_int)
                 return DeliveryResult(success=True, reason="dm-sent")
             except (discord.Forbidden, discord.NotFound) as e:
@@ -1447,8 +1568,11 @@ class HotDealService:
             timestamp=datetime.now(timezone.utc),
         )
 
+        attachment_filename = str(deal.get("image_filename", "") or "")
         raw_thumbnail = str(deal.get("image_url", "") or "").strip()
-        if self._looks_like_web_url(raw_thumbnail):
+        if attachment_filename and deal.get("image_bytes"):
+            embed.set_thumbnail(url=f"attachment://{attachment_filename}")
+        elif self._looks_like_web_url(raw_thumbnail):
             embed.set_thumbnail(url=raw_thumbnail)
 
         raw_logo = str(deal.get("logo", "") or "").strip()
