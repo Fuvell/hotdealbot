@@ -26,6 +26,11 @@ try:
 except ImportError:
     SOUP_PARSER = "html.parser"
 
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:  # optional dependency; crawlers fall back to urllib
+    curl_requests = None
+
 
 def make_soup(html: str) -> BeautifulSoup:
     return BeautifulSoup(html, SOUP_PARSER)
@@ -68,11 +73,20 @@ class BaseCrawler(metaclass=ABCMeta):
     across fetch cycles.
     """
 
+    # Some anti-bot systems (quasarzone) fingerprint the TLS handshake and
+    # block Python's default stack from datacenter IPs while letting real
+    # browsers through. Subclasses set this to fetch via curl_cffi, which
+    # impersonates Chrome's TLS fingerprint. Falls back to urllib silently
+    # when curl_cffi is not installed.
+    USE_BROWSER_TLS = False
+    BROWSER_TLS_IMPERSONATE = "chrome"
+
     def __init__(self, name: str, url_list: list[str]) -> None:
         self.url_list = url_list
         self.name = name
         self.logger = logging.getLogger(f"crawler.{self.__class__.__name__}")
         self._prev_status = 200  # track repeated error codes
+        self._impersonated_session = None
 
         # Cache of (html hash, parse result) per list URL: most 1-minute
         # polls hit an unchanged page, so parsing can be skipped entirely.
@@ -111,6 +125,9 @@ class BaseCrawler(metaclass=ABCMeta):
         return data
 
     def request(self, url: str) -> str | None:
+        if self.USE_BROWSER_TLS and curl_requests is not None:
+            return self._request_impersonated(url)
+
         req = urllib.request.Request(url, headers=self.headers)
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
@@ -150,6 +167,42 @@ class BaseCrawler(metaclass=ABCMeta):
         except Exception as e:
             self.logger.error(f"Exception: {e} ({url})")
             return None
+
+    def _request_impersonated(self, url: str) -> str | None:
+        """Fetch with a real-browser TLS fingerprint via curl_cffi."""
+        try:
+            if self._impersonated_session is None:
+                self._impersonated_session = curl_requests.Session(
+                    impersonate=self.BROWSER_TLS_IMPERSONATE
+                )
+            # Let curl_cffi supply the User-Agent/Accept-Encoding that match
+            # the impersonated browser; a mismatch is itself a bot signal.
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in ("user-agent", "accept-encoding")
+            }
+            response = self._impersonated_session.get(
+                url, headers=headers, timeout=15, allow_redirects=True
+            )
+        except Exception as e:
+            self.logger.error(f"Impersonated request error: {e} ({url})")
+            return None
+
+        status_code = int(response.status_code)
+        if status_code != 200:
+            if status_code != self._prev_status:
+                self.logger.error(f"Client response error: {status_code} ({url})")
+            else:
+                self.logger.info(f"Client response error [skip]: {status_code} ({url})")
+            self._prev_status = status_code
+            return None
+
+        self._prev_status = status_code
+        if len(response.content) > MAX_RESPONSE_BYTES:
+            self.logger.error(f"Response exceeds {MAX_RESPONSE_BYTES} bytes; discarding ({url})")
+            return None
+        return response.text
 
     @abstractmethod
     def parsing(self, html: str) -> dict[int, BaseArticle]:

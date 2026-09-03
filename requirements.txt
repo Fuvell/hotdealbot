@@ -5,6 +5,8 @@ lxml>=5.0
 python-dotenv>=1.0
 psutil>=5.9
 tzdata>=2024.1
+# Browser TLS fingerprint impersonation (quasarzone anti-bot bypass).
+curl_cffi>=0.7
 # Optional: browser fallback for FMKorea anti-bot blocks.
 # Requires an extra step after install: `playwright install chromium`
 playwright>=1.40

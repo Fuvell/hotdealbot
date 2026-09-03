@@ -6,6 +6,8 @@ import re
 _MANWON_RE = re.compile(r"(\d+(?:\.\d+)?)\s*만\s*원?")
 # "22,900원", "7200원"
 _WON_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*원")
+# "₩15,938" / "￦15,938" (quasarzone v2 layout)
+_WON_SYMBOL_RE = re.compile(r"[₩￦]\s*(\d[\d,]*(?:\.\d+)?)")
 _USD_RE = re.compile(r"[$＄]\s*(\d[\d,]*(?:\.\d+)?)")
 _EUR_RE = re.compile(r"[€]\s*(\d[\d,]*(?:\.\d+)?)")
 _JPY_RE = re.compile(r"[¥￥]\s*(\d[\d,]*(?:\.\d+)?)")
@@ -28,6 +30,10 @@ def parse_price(raw: str | None) -> tuple[float | None, str]:
         return float(match.group(1)) * 10000, "KRW"
 
     match = _WON_RE.search(text)
+    if match:
+        return float(match.group(1).replace(",", "")), "KRW"
+
+    match = _WON_SYMBOL_RE.search(text)
     if match:
         return float(match.group(1).replace(",", "")), "KRW"
 

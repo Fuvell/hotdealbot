@@ -70,15 +70,132 @@ def _upgrade_quasar_image_url(url: str) -> str:
         return ""
     if "quasarzone.com" in text:
         head, sep, tail = text.rpartition("/")
-        if sep and tail.startswith("thumb_"):
-            return f"{head}/{tail[len('thumb_'):]}"
+        if sep:
+            # legacy table layout used thumb_<hash>.<ext>; the v2 layout
+            # uses qt_<hash>.webp — both have the original at the bare name.
+            for prefix in ("thumb_", "qt_"):
+                if tail.startswith(prefix):
+                    return f"{head}/{tail[len(prefix):]}"
+    return text
+
+
+_WON_PRICE_RE = re.compile(r"^[₩￦]\s*([\d,]+(?:\.\d+)?)$")
+
+
+def _normalize_won_price(raw: str) -> str:
+    """'￦15,938' (v2 layout) -> '15,938원', matching the other sites."""
+    text = str(raw or "").strip()
+    match = _WON_PRICE_RE.match(text)
+    if match:
+        return f"{match.group(1)}원"
     return text
 
 
 class QuasarzoneCrawler(BaseCrawler):
+    # Quasarzone serves a 403 captcha wall to Python's default TLS stack from
+    # datacenter IPs but accepts a Chrome TLS fingerprint (verified live).
+    USE_BROWSER_TLS = True
+
     def parsing(self, html: str) -> Dict[int, BaseArticle]:
         soup = make_soup(html)
 
+        v2_data = self._parse_v2_layout(soup)
+        if v2_data:
+            return v2_data
+
+        return self._parse_legacy_layout(soup)
+
+    def _parse_v2_layout(self, soup) -> Dict[int, BaseArticle]:
+        """Quasarzone's div-based 'v2' list (rolled out Sep 2026)."""
+        rows = soup.select("div.v2-list-row.v2-list-row--hotdeal")
+        if not rows:
+            return {}
+
+        head = soup.select_one(".v2-board-head__title")
+        board_name = head.get_text(" ", strip=True) if head else "핫딜 게시판"
+
+        data: Dict[int, BaseArticle] = {}
+        for row in rows:
+            link = row.select_one("p.tit a.subject-link") or row.select_one("a.subject-link")
+            if link is None:
+                continue
+            href = str(link.get("href", "") or "")
+            match = re.search(r"/bbs/([\w\d_]+)/views/(\d+)", href)
+            if match is None:
+                continue
+            board_id = match.group(1)
+            article_id = int(match.group(2))
+
+            raw_title = link.get_text(" ", strip=True)
+            title = re.sub(r"^\[.*?\]\s*", "", raw_title).strip()
+            if not title:
+                continue
+
+            badge = row.select_one(".v2-list-row__line1 .v2-badge")
+            category_raw = badge.get_text(" ", strip=True) if badge else ""
+
+            price_tag = row.select_one(".v2-list-row__price")
+            price = _normalize_won_price(price_tag.get_text(" ", strip=True)) if price_tag else ""
+
+            image_url = str(row.get("data-preview", "") or "").strip()
+            if not image_url:
+                thumb = row.select_one(".v2-list-row__thumb")
+                style = str(thumb.get("style", "") or "") if thumb else ""
+                style_match = re.search(r"url\(['\"]?([^'\")]+)", style)
+                image_url = style_match.group(1) if style_match else ""
+            image_url = _upgrade_quasar_image_url(image_url) or None
+
+            nick_tag = row.select_one(".user-nick-wrap[data-nick]")
+            writer_name = str(nick_tag.get("data-nick", "") or "") if nick_tag else ""
+
+            recommend_tag = row.select_one(".v2-list-row__num")
+            view_tag = row.select_one(".qc-count-hit")
+
+            is_end = row.select_one(".v2-thumb-done") is not None or any(
+                b.get_text(strip=True) in {"종료", "End"} for b in row.select(".v2-badge")
+            )
+
+            store = ""
+            delivery = ""
+            ship_tags = row.select(".v2-list-row__ship")
+            if ship_tags:
+                store_img = ship_tags[0].select_one("img")
+                store = (
+                    str(store_img.get("alt", "") or "")
+                    if store_img
+                    else ship_tags[0].get_text(" ", strip=True)
+                )
+                if len(ship_tags) > 1:
+                    delivery = (
+                        ship_tags[-1].get_text(" ", strip=True).replace("배송비", "").strip()
+                    )
+
+            data[article_id] = {
+                "article_id": article_id,
+                "board_id": board_id,
+                "title": title,
+                "category": category_raw,
+                "site_name": "퀘이사존",
+                "site_color": "ff9900",
+                "board_name": board_name,
+                "writer_name": writer_name,
+                "crawler_name": self.name,
+                "logo": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSbxUBUWksXWUh0hKjndR29gmjbxdF2yVxFQg&s",
+                "url": f"https://quasarzone.com/bbs/{board_id}/views/{article_id}",
+                "is_end": is_end,
+                "extra": {
+                    "recommend": recommend_tag.get_text(strip=True) if recommend_tag else "",
+                    "view": view_tag.get_text(strip=True) if view_tag else "",
+                    "image_url": image_url,
+                    "price": price,
+                    "store": store,
+                    "delivery": delivery,
+                },
+            }
+        return data
+
+    def _parse_legacy_layout(self, soup) -> Dict[int, BaseArticle]:
+        """Pre-Sep-2026 table layout, kept as a fallback."""
         if (_board_name := soup.select_one(".l-title h2")) is None:
             self.logger.error("Can't find board name, skip parsing")
             return {}
