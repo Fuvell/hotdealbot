@@ -267,6 +267,14 @@ class HotDealService:
         self.enforce_source_domain_allowlist = (
             str(os.getenv("ENFORCE_SOURCE_DOMAIN_ALLOWLIST", "1")).strip() != "0"
         )
+        # Crawlers to skip entirely (no fetch, no retries, no Playwright).
+        # fmkorea is off by default: its anti-bot wall blocks server IPs
+        # outright (see git history); re-enable via DISABLED_CRAWLERS="".
+        self.disabled_crawlers = {
+            name.strip().lower()
+            for name in os.getenv("DISABLED_CRAWLERS", "fmkorea").split(",")
+            if name.strip()
+        }
 
     ############################
     # State loading / config
@@ -295,6 +303,12 @@ class HotDealService:
                 vacuum_db()
             except Exception:
                 error_logger.exception("Failed to VACUUM after startup purge.")
+
+        if self.disabled_crawlers:
+            runtime_logger.info(
+                "Disabled crawlers (DISABLED_CRAWLERS): "
+                + ", ".join(sorted(self.disabled_crawlers))
+            )
 
         runtime_logger.info(
             "Loaded state from SQLite: "
@@ -1529,22 +1543,27 @@ class HotDealService:
         self._record_crawler_failure(crawler_name, last_error_reason)
         return []
 
+    CRAWLERS: tuple[tuple[str, Callable[[], list[dict]]], ...] = (
+        ("quasarzone", fetch_hot_deals),
+        ("arcalive", fetch_hot_deals_arca),
+        ("fmkorea", fetch_hot_deals_fmkorea),
+        ("ppomppu", fetch_hot_deals_ppomppu),
+        ("eomisae", fetch_hot_deals_eomisae),
+    )
+
     async def fetch_all_deals(self) -> list[dict]:
-        quasar_future = self._fetch_site_with_retry("quasarzone", fetch_hot_deals)
-        arca_future = self._fetch_site_with_retry("arcalive", fetch_hot_deals_arca)
-        fmkorea_future = self._fetch_site_with_retry("fmkorea", fetch_hot_deals_fmkorea)
-        ppomppu_future = self._fetch_site_with_retry("ppomppu", fetch_hot_deals_ppomppu)
-        eomisae_future = self._fetch_site_with_retry("eomisae", fetch_hot_deals_eomisae)
-        quasar_deals, arca_deals, fmkorea_deals, ppomppu_deals, eomisae_deals = (
-            await asyncio.gather(
-                quasar_future,
-                arca_future,
-                fmkorea_future,
-                ppomppu_future,
-                eomisae_future,
-            )
+        enabled = [
+            (name, fetch_func)
+            for name, fetch_func in self.CRAWLERS
+            if name not in self.disabled_crawlers
+        ]
+        results = await asyncio.gather(
+            *(self._fetch_site_with_retry(name, fetch_func) for name, fetch_func in enabled)
         )
-        return quasar_deals + arca_deals + fmkorea_deals + ppomppu_deals + eomisae_deals
+        all_deals: list[dict] = []
+        for site_deals in results:
+            all_deals.extend(site_deals)
+        return all_deals
 
     ############################
     # Embeds
